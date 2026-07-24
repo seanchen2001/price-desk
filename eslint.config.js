@@ -10,5 +10,19 @@ export default tseslint.config(
       // guardrail R4: nada de catch{} que trague errores
       "no-empty": ["error", { "allowEmptyCatch": false }],
     },
+  },
+  {
+    // scripts Node sueltos (.mjs): globals de Node para no-undef
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        fetch: "readonly",
+        setTimeout: "readonly",
+        URL: "readonly",
+        WebSocket: "readonly",
+      },
+    },
   }
 );

@@ -18,6 +18,7 @@ export interface Database {
           id?: string;
           name?: string;
         };
+        Relationships: [];
       };
       chat_log: {
         Row: {
@@ -41,6 +42,7 @@ export interface Database {
           actions?: Json | null;
           final_text?: string | null;
         };
+        Relationships: [];
       };
       clients: {
         Row: {
@@ -73,6 +75,7 @@ export interface Database {
           es_nuestra?: boolean;
           deleted_at?: string | null;
         };
+        Relationships: [];
       };
       departments: {
         Row: {
@@ -87,6 +90,7 @@ export interface Database {
           id?: string;
           name?: string;
         };
+        Relationships: [];
       };
       drafts: {
         Row: {
@@ -104,6 +108,7 @@ export interface Database {
           payload?: Json;
           updated_at?: string;
         };
+        Relationships: [];
       };
       invoice_item_units: {
         Row: {
@@ -124,6 +129,7 @@ export interface Database {
           imei?: string | null;
           serial?: string | null;
         };
+        Relationships: [];
       };
       invoice_items: {
         Row: {
@@ -159,6 +165,7 @@ export interface Database {
           cost?: number | null;
           price?: number | null;
         };
+        Relationships: [];
       };
       invoices: {
         Row: {
@@ -215,6 +222,7 @@ export interface Database {
           created_at?: string;
           deleted_at?: string | null;
         };
+        Relationships: [];
       };
       knowledge: {
         Row: {
@@ -232,6 +240,7 @@ export interface Database {
           rule_text?: string;
           created_at?: string;
         };
+        Relationships: [];
       };
       ledger: {
         Row: {
@@ -270,6 +279,7 @@ export interface Database {
           date?: string | null;
           ref_invoice_id?: string | null;
         };
+        Relationships: [];
       };
       model_aliases: {
         Row: {
@@ -293,6 +303,7 @@ export interface Database {
           alias_key?: string;
           created_at?: string;
         };
+        Relationships: [];
       };
       models: {
         Row: {
@@ -328,6 +339,7 @@ export interface Database {
           updated_at?: string;
           deleted_at?: string | null;
         };
+        Relationships: [];
       };
       ops_tracking: {
         Row: {
@@ -351,6 +363,7 @@ export interface Database {
           pago?: boolean;
           cargamos_nosotros?: boolean;
         };
+        Relationships: [];
       };
       price_history: {
         Row: {
@@ -374,6 +387,7 @@ export interface Database {
           price?: number;
           ts?: string;
         };
+        Relationships: [];
       };
       price_tiers: {
         Row: {
@@ -397,6 +411,7 @@ export interface Database {
           min_qty?: number;
           price?: number;
         };
+        Relationships: [];
       };
       prices: {
         Row: {
@@ -420,6 +435,7 @@ export interface Database {
           price?: number;
           updated_at?: string;
         };
+        Relationships: [];
       };
       sale_prices: {
         Row: {
@@ -437,6 +453,7 @@ export interface Database {
           price?: number;
           manual?: boolean;
         };
+        Relationships: [];
       };
       shippings: {
         Row: {
@@ -466,6 +483,7 @@ export interface Database {
           contacto?: string | null;
           deleted_at?: string | null;
         };
+        Relationships: [];
       };
       snapshots: {
         Row: {
@@ -486,6 +504,7 @@ export interface Database {
           taken_at?: string;
           payload?: Json;
         };
+        Relationships: [];
       };
       suppliers: {
         Row: {
@@ -506,6 +525,7 @@ export interface Database {
           code?: string | null;
           active?: boolean;
         };
+        Relationships: [];
       };
     };
     Views: Record<string, never>;

@@ -45,7 +45,9 @@ for (const [name, def] of Object.entries(spec.definitions ?? {}).sort()) {
     return `          ${c}${optional ? "?" : ""}: ${base}${nullable ? " | null" : ""};`;
   }).join("\n");
   const upd = cols.map(([c, p]) => `          ${c}?: ${tsType(p)}${req.has(c) ? "" : " | null"};`).join("\n");
-  out += `      ${name}: {\n        Row: {\n${row}\n        };\n        Insert: {\n${ins}\n        };\n        Update: {\n${upd}\n        };\n      };\n`;
+  // Relationships: [] — requerido por GenericTable de supabase-js (sin él, los tipos
+  // de .insert()/.update() colapsan a never). No tipamos las FKs (no usamos joins tipados).
+  out += `      ${name}: {\n        Row: {\n${row}\n        };\n        Insert: {\n${ins}\n        };\n        Update: {\n${upd}\n        };\n        Relationships: [];\n      };\n`;
 }
 out += `    };
     Views: Record<string, never>;
