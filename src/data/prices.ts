@@ -158,7 +158,12 @@ export function useUpsertPrice() {
   const qc = useQueryClient();
   return useMutation({
     mutationKey: [...keys.prices(), "upsert"],
-    mutationFn: (vars: PriceUpsert) => upsertPrice(vars),
+    // upsert de la fila + registro append-only en price_history (para analítica)
+    mutationFn: async (vars: PriceUpsert) => {
+      const row = await upsertPrice(vars);
+      await appendPriceHistory(vars);
+      return row;
+    },
     onMutate: async (vars) => {
       await qc.cancelQueries({ queryKey: keys.prices() });
       const affected = [keys.prices(), keys.prices(vars.model_id)];
@@ -173,7 +178,11 @@ export function useUpsertPrice() {
         if (data !== undefined) qc.setQueryData(k, data);
       }
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: keys.prices() }),
+    onSettled: (_data, _error, vars) =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: keys.prices() }),
+        qc.invalidateQueries({ queryKey: keys.priceHistory(vars.model_id) }),
+      ]),
   });
 }
 
@@ -250,6 +259,26 @@ export function useUpsertSalePrice() {
         const i = rows.findIndex((r) => r.model_id === vars.model_id);
         return i === -1 ? [...rows, next] : rows.map((r, j) => (j === i ? next : r));
       });
+      return { prev };
+    },
+    onError: (_error, _vars, ctx) => {
+      if (ctx?.prev !== undefined) qc.setQueryData(keys.salePrices, ctx.prev);
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.salePrices }),
+  });
+}
+
+export function useDeleteSalePrice() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationKey: [...keys.salePrices, "delete"],
+    mutationFn: (modelId: string) => deleteSalePrice(modelId),
+    onMutate: async (modelId) => {
+      await qc.cancelQueries({ queryKey: keys.salePrices });
+      const prev = qc.getQueryData<SalePriceRow[]>(keys.salePrices);
+      qc.setQueryData<SalePriceRow[]>(keys.salePrices, (rows) =>
+        rows?.filter((r) => r.model_id !== modelId),
+      );
       return { prev };
     },
     onError: (_error, _vars, ctx) => {

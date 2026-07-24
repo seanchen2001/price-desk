@@ -5,6 +5,8 @@ import type { Database } from "./database.types";
 export type TableName = keyof Database["public"]["Tables"];
 
 export const keys = {
+  departments: ["departments"] as const,
+  categories: ["categories"] as const,
   models: ["models"] as const,
   aliases: (modelId?: string) =>
     modelId === undefined ? (["model_aliases"] as const) : (["model_aliases", modelId] as const),
@@ -37,6 +39,8 @@ export const keys = {
 // Son las tablas mutables que la app observa; la publication (0002_realtime.sql)
 // habilita TODAS las tablas para no necesitar otra migración en fases futuras.
 export const realtimeInvalidation: ReadonlyArray<readonly [TableName, readonly string[]]> = [
+  ["departments", keys.departments],
+  ["categories", keys.categories],
   ["models", keys.models],
   ["model_aliases", keys.aliases()],
   ["prices", keys.prices()],

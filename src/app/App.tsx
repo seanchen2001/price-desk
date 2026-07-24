@@ -1,15 +1,15 @@
-// Vista de PRUEBA de la Fase 4 (la Mesa real es Fase 5): valida el stack end-to-end en
-// el navegador — lista de models (useQuery), alta canónica con self-alias (mutación),
-// errores visibles vía el hub central, y propagación Realtime entre pestañas.
-import { useEffect, useState, type FormEvent } from "react";
+// Shell Fase 5: la Mesa de precios sobre el core nuevo. Errores de datos SIEMPRE
+// visibles (hub central → toast). El seed idempotente de departments/categories corre
+// al boot (ver src/data/departments.ts — decisión: upsert al boot, no migración de datos).
+import { useEffect, useState } from "react";
 import { errorMessage, setDataErrorHandler } from "../data/errors";
-import { useModels } from "../data/models";
-import { useCreateModelWithAlias } from "../data/resolverRepo";
+import { useEnsureCatalogSeed } from "../data/departments";
+import { MesaView } from "../features/mesa/MesaView";
+import s from "../features/mesa/styles";
 
 export function App() {
   const [toast, setToast] = useState<string | null>(null);
   useEffect(() => {
-    // el hub central de errores de datos → toast global (además de la consola)
     setDataErrorHandler(({ operation, error }) => {
       console.error(`[data] ${operation} falló:`, error);
       setToast(`${operation}: ${errorMessage(error)}`);
@@ -17,66 +17,45 @@ export function App() {
     return () => setDataErrorHandler(null);
   }, []);
 
-  const models = useModels();
-  const createModel = useCreateModelWithAlias();
-  const [name, setName] = useState("");
-
-  const onSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    const canonicalName = name.trim();
-    if (!canonicalName) return;
-    createModel.mutate({ canonicalName }, { onSuccess: () => setName("") });
-  };
+  useEnsureCatalogSeed();
 
   return (
-    <main style={{ fontFamily: "system-ui", padding: 24, maxWidth: 640 }}>
-      <h1>Price Desk v2 — Fase 4</h1>
-      <p style={{ color: "#666" }}>
-        Vista de prueba de la capa de datos (TanStack Query + Realtime). Abrí dos pestañas:
-        el alta en una aparece en la otra sin recargar (requiere 0002_realtime.sql aplicado).
-      </p>
+    <main style={s.page}>
+      <div style={s.header}>
+        <h1 style={s.h1}>PRICE DESK</h1>
+        <span style={s.sub}>v2 · Fase 5 — Mesa de precios</span>
+      </div>
 
       {toast && (
         <div
           role="alert"
-          style={{ background: "#fee", border: "1px solid #c00", padding: 8, marginBottom: 12 }}
+          style={{
+            background: "#2a1117",
+            border: "1px solid #7f1d1d",
+            color: "#fca5a5",
+            borderRadius: 6,
+            padding: "8px 12px",
+            marginBottom: 12,
+            fontSize: 12.5,
+          }}
         >
-          {toast}{" "}
-          <button onClick={() => setToast(null)} style={{ marginLeft: 8 }}>
+          {toast}
+          <button
+            onClick={() => setToast(null)}
+            style={{
+              marginLeft: 12,
+              background: "transparent",
+              color: "#fca5a5",
+              border: "none",
+              cursor: "pointer",
+            }}
+          >
             ×
           </button>
         </div>
       )}
 
-      <form onSubmit={onSubmit} style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="Nombre canónico del modelo (ej: S26 Ultra 12/512)"
-          style={{ flex: 1, padding: 6 }}
-        />
-        <button type="submit" disabled={createModel.isPending}>
-          {createModel.isPending ? "Creando…" : "Crear modelo"}
-        </button>
-      </form>
-
-      {models.isLoading && <p>Cargando modelos…</p>}
-      {models.isError && <p style={{ color: "#c00" }}>Error: {errorMessage(models.error)}</p>}
-      {models.data && (
-        <>
-          <p>
-            <strong>{models.data.length}</strong> modelos
-          </p>
-          <ul>
-            {models.data.map((m) => (
-              <li key={m.id}>
-                {m.canonical_name}{" "}
-                <code style={{ color: "#999", fontSize: 12 }}>{m.id.slice(0, 8)}</code>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
+      <MesaView />
     </main>
   );
 }
