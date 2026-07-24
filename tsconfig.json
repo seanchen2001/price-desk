@@ -17,5 +17,5 @@
     "noEmit": true,
     "types": ["vitest/globals", "node"]
   },
-  "include": ["src", "test", "vite.config.ts"]
+  "include": ["src", "test", "api", "vite.config.ts"]
 }

@@ -33,6 +33,13 @@ export type ParsedQuote = {
 // "(20 pcs)" | "(50+ pcs)" | "(1-20 pcs)" | "(20u)" | "(20)" → cantidad mínima del escalón.
 const QTY_RE = /\((\d+)\s*(?:\+|-\s*\d+)?\s*(?:pcs?|pzs?|pz|u|un|unid(?:ades)?)?\s*\)/i;
 
+/** Cantidad mínima "(N pcs)" embebida en un nombre, o null. Lo usa también la extracción
+ *  con IA como red defensiva (si el modelo desobedece y manda escalones como ítems). */
+export function qtyFromName(name: string): number | null {
+  const m = QTY_RE.exec(name);
+  return m ? Number(m[1]) : null;
+}
+
 // nombre (al menos una letra) + separadores + número final (+ moneda opcional)
 const LINE_RE = /^(.+?)[\s:=·–—-]*\$?\s*(\d[\d.,]*)\s*(?:usd|u\$s|us\$|\$)?\s*$/i;
 

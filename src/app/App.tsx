@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import { errorMessage, setDataErrorHandler } from "../data/errors";
 import { useEnsureCatalogSeed } from "../data/departments";
+import { AgentView } from "../features/agent/AgentView";
 import { AnaliticaView } from "../features/analitica/AnaliticaView";
 import { ClientesView } from "../features/clientes/ClientesView";
 import { CuentasView } from "../features/cuentas/CuentasView";
@@ -15,7 +16,15 @@ import { OrdenesView } from "../features/ordenes/OrdenesView";
 import { PnLView } from "../features/pnl/PnLView";
 import s from "../features/mesa/styles";
 
-type Tab = "mesa" | "ordenes" | "historial" | "clientes" | "cuentas" | "pnl" | "analitica";
+type Tab =
+  | "mesa"
+  | "ordenes"
+  | "historial"
+  | "clientes"
+  | "cuentas"
+  | "pnl"
+  | "analitica"
+  | "agente";
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: "mesa", label: "Mesa" },
@@ -25,6 +34,7 @@ const TABS: Array<{ id: Tab; label: string }> = [
   { id: "cuentas", label: "Cuentas" },
   { id: "pnl", label: "PnL" },
   { id: "analitica", label: "Analítica" },
+  { id: "agente", label: "Agente" },
 ];
 
 export function App() {
@@ -47,7 +57,7 @@ export function App() {
     <main style={s.page}>
       <div style={s.header}>
         <h1 style={s.h1}>PRICE DESK</h1>
-        <span style={s.sub}>v2 · Fase 7 — Mesa · Órdenes · Historial · Clientes · Cuentas · PnL · Analítica</span>
+        <span style={s.sub}>v2 · Fase 8 — Mesa · Órdenes · Historial · Clientes · Cuentas · PnL · Analítica · Agente</span>
         <span style={{ display: "inline-flex", gap: 6, marginLeft: 16 }}>
           {TABS.map((t) => (
             <button
@@ -118,6 +128,7 @@ export function App() {
       {tab === "cuentas" && <CuentasView />}
       {tab === "pnl" && <PnLView />}
       {tab === "analitica" && <AnaliticaView />}
+      {tab === "agente" && <AgentView />}
     </main>
   );
 }

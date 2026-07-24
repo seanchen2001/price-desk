@@ -1,11 +1,24 @@
 // Pegar lista → parser SIN IA → resolvedor → preview (viejo→nuevo) → aplicar.
 // Los matches se aplican por model_id; los candidateNew se mandan a la cola de
 // confirmación (NUNCA se auto-crea nada — guardrail del rebuild).
-import { useMemo, useState } from "react";
+//
+// Fase 8 — "Analizar con IA": extracción propose-only (Gemini 2.5 Flash, temp 0,
+// responseSchema). La IA SOLO propone [{rawName, price, tiers}]; el flujo después es el
+// MISMO (planQuote → resolver → cola). Auto-aplica únicamente matches existentes con
+// delta ≤ ±15% (umbral del viejo); delta grande queda en el preview para confirmar y lo
+// nuevo SIEMPRE va a la cola.
+import { useMemo, useState, type ClipboardEvent } from "react";
 import { useModels } from "../../data/models";
 import { usePrices } from "../../data/prices";
 import { useInsertSupplier, useSuppliers } from "../../data/suppliers";
 import { parseQuoteText } from "../../domain/quoteParser";
+import {
+  extractQuoteAI,
+  extractedToQuoteEntries,
+  withinAutoThreshold,
+  PRICE_AUTO_THRESHOLD,
+} from "../agent/extraction";
+import type { GeminiImage } from "../agent/gemini";
 import {
   planQuote,
   useApplyMatched,
@@ -36,8 +49,10 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
   const [supplierId, setSupplierId] = useState("");
   const [newSupplier, setNewSupplier] = useState("");
   const [rawText, setRawText] = useState("");
+  const [images, setImages] = useState<GeminiImage[]>([]);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [planning, setPlanning] = useState(false);
+  const [aiBusy, setAiBusy] = useState(false);
   const [msg, setMsg] = useState<{ err: boolean; text: string } | null>(null);
 
   const supplierRows = suppliers.data ?? [];
@@ -69,6 +84,84 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
       setMsg({ err: true, text: e instanceof Error ? e.message : String(e) });
     } finally {
       setPlanning(false);
+    }
+  };
+
+  // captura screenshots pegados en el textarea (Ctrl+V de una imagen) para la extracción IA
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    for (const item of Array.from(e.clipboardData?.items ?? [])) {
+      if (!item.type.startsWith("image/")) continue;
+      const file = item.getAsFile();
+      if (!file) continue;
+      e.preventDefault();
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result ?? "");
+        const b64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+        if (b64) setImages((prev) => [...prev, { mimeType: file.type, data: b64 }]);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const runAI = async () => {
+    setMsg(null);
+    if (!selectedSupplier) {
+      setMsg({ err: true, text: "Elegí a qué proveedor cargar la cotización." });
+      return;
+    }
+    if (!rawText.trim() && images.length === 0) {
+      setMsg({ err: true, text: "Pegá el texto de la cotización o un screenshot." });
+      return;
+    }
+    setAiBusy(true);
+    setPreview(null);
+    try {
+      const textArg = rawText.trim() === "" ? {} : { text: rawText };
+      const items = await extractQuoteAI({ ...textArg, images });
+      if (items.length === 0) {
+        setMsg({ err: true, text: "La IA no encontró ningún producto con precio." });
+        return;
+      }
+      const entries = extractedToQuoteEntries(items);
+      const plan = await planQuote(entries);
+      const auto: MatchedEntry[] = [];
+      const review: MatchedEntry[] = [];
+      for (const m of plan.matched) {
+        (withinAutoThreshold(currentPrice(m.modelId), m.entry.price) ? auto : review).push(m);
+      }
+      if (auto.length > 0) {
+        await applyMatched.mutateAsync({ supplierId: selectedSupplier.id, matched: auto });
+      }
+      const queued = plan.candidates.map((c) => ({
+        ...c,
+        supplierId: selectedSupplier.id,
+        supplierName: selectedSupplier.name,
+      }));
+      if (queued.length > 0) props.onQueue(queued);
+      const detected = items.find((i) => i.supplier !== "")?.supplier ?? "";
+      const supplierNote =
+        detected !== "" && detected.toLowerCase() !== selectedSupplier.name.toLowerCase()
+          ? ` · OJO: el texto menciona al proveedor “${detected}” (cargué a ${selectedSupplier.name})`
+          : "";
+      setMsg({
+        err: false,
+        text:
+          `IA: apliqué ${auto.length} precio(s)` +
+          (review.length ? ` · ${review.length} con delta > ±${PRICE_AUTO_THRESHOLD}% a confirmar abajo` : "") +
+          (queued.length ? ` · ${queued.length} nuevo(s) → cola de confirmación` : "") +
+          supplierNote,
+      });
+      if (review.length > 0) {
+        setPreview({ matched: review, candidates: [], unparsed: [] });
+      } else {
+        setRawText("");
+        setImages([]);
+      }
+    } catch (e) {
+      setMsg({ err: true, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setAiBusy(false);
     }
   };
 
@@ -115,7 +208,10 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
 
   return (
     <section style={s.section}>
-      <div style={s.sectionTitle}>Pegar lista — parser sin IA (la extracción con IA es Fase 8)</div>
+      <div style={s.sectionTitle}>
+        Pegar lista — parser de texto o “Analizar con IA” (propose-only: la IA solo propone;
+        resuelve el resolvedor)
+      </div>
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", flexWrap: "wrap" }}>
         <select value={supplierId} onChange={(e) => setSupplierId(e.target.value)} style={s.select}>
           <option value="">— proveedor —</option>
@@ -145,20 +241,39 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
             setRawText(e.target.value);
             setPreview(null);
           }}
+          onPaste={onPaste}
           rows={3}
           placeholder={
-            'ej.\nS26 12+512 5G DS (20 pcs) 610\nS26 12+512 5G DS (50+ pcs) 595\niPhone 17 Pro 256GB Blue US Specs 999'
+            'ej.\nS26 12+512 5G DS (20 pcs) 610\nS26 12+512 5G DS (50+ pcs) 595\niPhone 17 Pro 256GB Blue US Specs 999\n(también podés pegar un screenshot para la IA)'
           }
           style={{ ...s.textarea, flex: 1, minWidth: 280 }}
         />
-        <button
-          onClick={() => void runParse()}
-          disabled={planning || !rawText.trim()}
-          style={{ ...s.primaryBtn, ...(planning ? s.busy : {}) }}
-        >
-          {planning ? "Resolviendo…" : "Parsear"}
-        </button>
+        <span style={{ display: "inline-flex", flexDirection: "column", gap: 6 }}>
+          <button
+            onClick={() => void runParse()}
+            disabled={planning || aiBusy || !rawText.trim()}
+            style={{ ...s.primaryBtn, ...(planning ? s.busy : {}) }}
+          >
+            {planning ? "Resolviendo…" : "Parsear"}
+          </button>
+          <button
+            onClick={() => void runAI()}
+            disabled={aiBusy || planning || (!rawText.trim() && images.length === 0)}
+            style={{ ...s.primaryBtn, ...(aiBusy ? s.busy : {}) }}
+            title="Extracción con Gemini (propose-only): tiers a la escala, nada se crea sin confirmar"
+          >
+            {aiBusy ? "Analizando…" : "✨ Analizar con IA"}
+          </button>
+        </span>
       </div>
+      {images.length > 0 && (
+        <div style={{ ...s.hint, display: "flex", gap: 8, alignItems: "center" }}>
+          {images.length} screenshot(s) para la IA
+          <button onClick={() => setImages([])} style={{ ...s.toolBtn, ...s.toolBtnGhost }}>
+            quitar
+          </button>
+        </div>
+      )}
 
       {msg && <div style={msg.err ? s.errorMsg : s.okMsg}>{msg.text}</div>}
 
