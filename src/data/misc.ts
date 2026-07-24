@@ -90,6 +90,10 @@ export async function upsertSnapshot(
 
 // ---------- ops_tracking (timeline del trade, PK = invoice_id) ----------
 
+export async function listOps(db: Db = supabase): Promise<OpsRow[]> {
+  return unwrap(await db.from("ops_tracking").select("*"));
+}
+
 export async function getOps(invoiceId: string, db: Db = supabase): Promise<OpsRow | null> {
   const res = await db.from("ops_tracking").select("*").eq("invoice_id", invoiceId).maybeSingle();
   if (res.error) throw res.error;
@@ -172,6 +176,10 @@ export function useUpsertSnapshot() {
     mutationFn: (vars: { week: string; payload: Json }) => upsertSnapshot(vars),
     onSettled: () => qc.invalidateQueries({ queryKey: keys.snapshots }),
   });
+}
+
+export function useAllOps() {
+  return useQuery({ queryKey: keys.opsTracking, queryFn: () => listOps() });
 }
 
 export function useOps(invoiceId: string) {

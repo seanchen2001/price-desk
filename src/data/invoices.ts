@@ -50,11 +50,14 @@ export async function softDeleteInvoice(id: string, db: Db = supabase): Promise<
 
 // ---------- invoice_items ----------
 
+/** Sin invoiceId lista TODOS los items (Historial/timeline arman el índice en memoria). */
 export async function listInvoiceItems(
-  invoiceId: string,
+  invoiceId?: string,
   db: Db = supabase,
 ): Promise<InvoiceItemRow[]> {
-  return unwrap(await db.from("invoice_items").select("*").eq("invoice_id", invoiceId));
+  let q = db.from("invoice_items").select("*");
+  if (invoiceId !== undefined) q = q.eq("invoice_id", invoiceId);
+  return unwrap(await q);
 }
 
 export async function insertInvoiceItem(
@@ -78,8 +81,31 @@ export async function deleteInvoiceItem(id: string, db: Db = supabase): Promise<
 
 // ---------- invoice_item_units (una fila por unidad física: IMEI + serie) ----------
 
-export async function listItemUnits(itemId: string, db: Db = supabase): Promise<ItemUnitRow[]> {
-  return unwrap(await db.from("invoice_item_units").select("*").eq("item_id", itemId));
+/** Sin itemId lista TODAS las unidades (Historial cuenta IMEIs cargados por factura). */
+export async function listItemUnits(itemId?: string, db: Db = supabase): Promise<ItemUnitRow[]> {
+  let q = db.from("invoice_item_units").select("*");
+  if (itemId !== undefined) q = q.eq("item_id", itemId);
+  return unwrap(await q);
+}
+
+/**
+ * Deja las unidades de UN item = qty filas (imei/serial por índice; sobran datos → se
+ * conservan filas extra para no perder lo pegado). Reemplazo scoped a un solo item —
+ * es la representación física de esa línea, no una colección compartida.
+ */
+export async function setUnitsForItem(
+  vars: { itemId: string; qty: number; imeis: readonly string[]; serials: readonly string[] },
+  db: Db = supabase,
+): Promise<ItemUnitRow[]> {
+  const units = Math.max(Number(vars.qty) || 0, vars.imeis.length, vars.serials.length);
+  unwrapVoid(await db.from("invoice_item_units").delete().eq("item_id", vars.itemId));
+  if (units === 0) return [];
+  const rows: ItemUnitInsert[] = Array.from({ length: units }, (_, u) => ({
+    item_id: vars.itemId,
+    imei: vars.imeis[u] ?? null,
+    serial: vars.serials[u] ?? null,
+  }));
+  return unwrap(await db.from("invoice_item_units").insert(rows).select());
 }
 
 export async function insertItemUnit(row: ItemUnitInsert, db: Db = supabase): Promise<ItemUnitRow> {
@@ -142,7 +168,7 @@ export function useSoftDeleteInvoice() {
   });
 }
 
-export function useInvoiceItems(invoiceId: string) {
+export function useInvoiceItems(invoiceId?: string) {
   return useQuery({
     queryKey: keys.invoiceItems(invoiceId),
     queryFn: () => listInvoiceItems(invoiceId),
@@ -177,8 +203,18 @@ export function useDeleteInvoiceItem() {
   });
 }
 
-export function useItemUnits(itemId: string) {
+export function useItemUnits(itemId?: string) {
   return useQuery({ queryKey: keys.itemUnits(itemId), queryFn: () => listItemUnits(itemId) });
+}
+
+export function useSetUnitsForItem() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationKey: [...keys.itemUnits(), "set-for-item"],
+    mutationFn: (vars: { itemId: string; qty: number; imeis: string[]; serials: string[] }) =>
+      setUnitsForItem(vars),
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.itemUnits() }),
+  });
 }
 
 export function useInsertItemUnit() {

@@ -50,6 +50,9 @@ export const realtimeInvalidation: ReadonlyArray<readonly [TableName, readonly s
   ["suppliers", keys.suppliers],
   ["invoices", keys.invoices],
   ["invoice_items", keys.invoiceItems()],
+  ["invoice_item_units", keys.itemUnits()],
+  ["shippings", keys.shippings],
+  ["drafts", keys.drafts],
   ["ledger", keys.ledger()],
   ["ops_tracking", keys.opsTracking],
 ];
