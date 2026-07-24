@@ -89,7 +89,9 @@ export function useMesaData(selectedDeptId: string | null, marginPct: number, hi
   return useMemo(() => {
     const deptRows = departments.data ?? [];
     const catRows = categories.data ?? [];
-    const supplierRows = suppliers.data ?? [];
+    // proveedor "sacado" en Clientes (active=false): sus precios quedan guardados pero la
+    // columna deja de mostrarse — misma semántica que el removeSupplier del viejo
+    const supplierRows = (suppliers.data ?? []).filter((sp) => sp.active);
     const modelRows = models.data ?? [];
     const priceRows = prices.data ?? [];
     const tierRows = tiers.data ?? [];

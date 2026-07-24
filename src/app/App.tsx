@@ -1,22 +1,30 @@
-// Shell Fase 6: router de tabs simple (Mesa | Órdenes | Historial; Mesa default).
-// Errores de datos SIEMPRE visibles (hub central → toast). El seed idempotente de
-// departments/categories corre al boot (ver src/data/departments.ts).
+// Shell Fase 7: router de tabs (Mesa | Órdenes | Historial | Clientes | Cuentas | PnL |
+// Analítica; Mesa default). Errores de datos SIEMPRE visibles (hub central → toast).
+// El seed idempotente de departments/categories corre al boot (src/data/departments.ts).
 // Cross-tab: "Editar" en Historial abre Órdenes en modo edición; el checkpoint de
 // IMEIs del timeline de Órdenes abre el editor de IMEIs en Historial.
 import { useEffect, useState } from "react";
 import { errorMessage, setDataErrorHandler } from "../data/errors";
 import { useEnsureCatalogSeed } from "../data/departments";
+import { AnaliticaView } from "../features/analitica/AnaliticaView";
+import { ClientesView } from "../features/clientes/ClientesView";
+import { CuentasView } from "../features/cuentas/CuentasView";
 import { HistorialView } from "../features/historial/HistorialView";
 import { MesaView } from "../features/mesa/MesaView";
 import { OrdenesView } from "../features/ordenes/OrdenesView";
+import { PnLView } from "../features/pnl/PnLView";
 import s from "../features/mesa/styles";
 
-type Tab = "mesa" | "ordenes" | "historial";
+type Tab = "mesa" | "ordenes" | "historial" | "clientes" | "cuentas" | "pnl" | "analitica";
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: "mesa", label: "Mesa" },
   { id: "ordenes", label: "Órdenes" },
   { id: "historial", label: "Historial" },
+  { id: "clientes", label: "Clientes" },
+  { id: "cuentas", label: "Cuentas" },
+  { id: "pnl", label: "PnL" },
+  { id: "analitica", label: "Analítica" },
 ];
 
 export function App() {
@@ -39,7 +47,7 @@ export function App() {
     <main style={s.page}>
       <div style={s.header}>
         <h1 style={s.h1}>PRICE DESK</h1>
-        <span style={s.sub}>v2 · Fase 6 — Mesa · Órdenes · Historial</span>
+        <span style={s.sub}>v2 · Fase 7 — Mesa · Órdenes · Historial · Clientes · Cuentas · PnL · Analítica</span>
         <span style={{ display: "inline-flex", gap: 6, marginLeft: 16 }}>
           {TABS.map((t) => (
             <button
@@ -106,6 +114,10 @@ export function App() {
           onAutoImeiHandled={() => setImeiInvoiceId(null)}
         />
       )}
+      {tab === "clientes" && <ClientesView />}
+      {tab === "cuentas" && <CuentasView />}
+      {tab === "pnl" && <PnLView />}
+      {tab === "analitica" && <AnaliticaView />}
     </main>
   );
 }
