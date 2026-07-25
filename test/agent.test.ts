@@ -20,6 +20,7 @@ import {
 } from "../src/domain/negotiation";
 import { listaPrice, whatsappQuoteText } from "../src/domain/whatsapp";
 import {
+  applyGate,
   buildExtractionSystem,
   checkQuoteEntry,
   deltaPct,
@@ -151,7 +152,11 @@ describe("Fase 8 — saneo de la respuesta de extracción", () => {
 
 // ---------- tools / ejecutor ----------
 
-function mockDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
+type SeedPrice = { model_id: string; supplier_id: string; price: number; updated_at?: string };
+type SeedTier = { model_id: string; supplier_id: string; min_qty: number; price: number };
+type MockSeed = { prices?: SeedPrice[]; tiers?: SeedTier[]; sales?: Array<{ model_id: string; price: number }> };
+
+function mockDeps(overrides: Partial<ToolDeps> = {}, seed?: MockSeed): ToolDeps {
   const models = [
     { id: "m1", canonical_name: "S26 12+512 5G DS", category_id: "c-sam", department_id: "d-tel" },
     { id: "m2", canonical_name: "A17 4+128 DS", category_id: "c-sam", department_id: "d-tel" },
@@ -160,6 +165,38 @@ function mockDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
     [normalize("S26 12+512 5G DS"), "m1"],
     [normalize("A17 4+128 DS"), "m2"],
   ]);
+  // STORE MUTABLE (P1): las escrituras impactan y las lecturas releen — el
+  // verify-after-write del executor se prueba contra estado real, no contra un fixture.
+  const now = () => new Date().toISOString();
+  const store = {
+    prices: (
+      seed?.prices ?? [
+        { model_id: "m1", supplier_id: "s-bax", price: 600 },
+        { model_id: "m1", supplier_id: "s-sou", price: 640 },
+      ]
+    ).map((r) => ({ updated_at: now(), ...r })),
+    tiers: (seed?.tiers ?? [
+      { model_id: "m1", supplier_id: "s-bax", min_qty: 1, price: 600 },
+      { model_id: "m1", supplier_id: "s-bax", min_qty: 50, price: 580 },
+    ]).map((t) => ({ ...t })),
+    sales: (seed?.sales ?? []).map((s) => ({ ...s })),
+  };
+  const upsertStorePrice = (row: { model_id: string; supplier_id: string; price: number }) => {
+    const i = store.prices.findIndex(
+      (r) => r.model_id === row.model_id && r.supplier_id === row.supplier_id,
+    );
+    if (i === -1) store.prices.push({ ...row, updated_at: now() });
+    else store.prices[i] = { ...store.prices[i]!, price: row.price, updated_at: now() };
+  };
+  const replaceStoreTiers = (
+    pair: { model_id: string; supplier_id: string },
+    tiers: ReadonlyArray<{ min_qty: number; price: number }>,
+  ) => {
+    store.tiers = store.tiers.filter(
+      (t) => !(t.model_id === pair.model_id && t.supplier_id === pair.supplier_id),
+    );
+    for (const t of tiers) store.tiers.push({ ...pair, ...t });
+  };
   const base: ToolDeps = {
     resolver: async () => ({
       findAliasKey: (k) => aliasMap.get(k) ?? null,
@@ -178,15 +215,9 @@ function mockDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
       { id: "s-bax", name: "Bax", active: true },
       { id: "s-sou", name: "South", active: true },
     ],
-    listPrices: async () => [
-      { model_id: "m1", supplier_id: "s-bax", price: 600, updated_at: new Date().toISOString() },
-      { model_id: "m1", supplier_id: "s-sou", price: 640, updated_at: new Date().toISOString() },
-    ],
-    listTiers: async () => [
-      { model_id: "m1", supplier_id: "s-bax", min_qty: 1, price: 600 },
-      { model_id: "m1", supplier_id: "s-bax", min_qty: 50, price: 580 },
-    ],
-    listSalePrices: async () => [],
+    listPrices: async () => store.prices.map((r) => ({ ...r })),
+    listTiers: async () => store.tiers.map((t) => ({ ...t })),
+    listSalePrices: async () => store.sales.map((s) => ({ ...s })),
     listClients: async () => [{ id: "cl1", name: "Ojus", esNuestra: false }],
     listOps: async () => [],
     deskData: async () => ({ invoices: [], ledger: [] }),
@@ -207,14 +238,41 @@ function mockDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
     renameCategory: vi.fn(async (id: string, name: string) => ({ id, name })),
     insertSupplier: vi.fn(async (name: string) => ({ id: "s-new", name, active: true })),
     setSupplierActive: vi.fn(async () => {}),
-    upsertPrice: vi.fn(async () => {}),
+    upsertPrice: vi.fn(async (row: { model_id: string; supplier_id: string; price: number }) => {
+      upsertStorePrice(row);
+    }),
     appendPriceHistory: vi.fn(async () => {}),
-    setTiersForPair: vi.fn(async () => {}),
-    deletePrice: vi.fn(async () => {}),
-    upsertSalePrice: vi.fn(async () => {}),
-    deleteSalePrice: vi.fn(async () => {}),
+    setTiersForPair: vi.fn(
+      async (
+        pair: { model_id: string; supplier_id: string },
+        tiers: Array<{ min_qty: number; price: number }>,
+      ) => {
+        replaceStoreTiers(pair, tiers);
+      },
+    ),
+    deletePrice: vi.fn(async (pair: { model_id: string; supplier_id: string }) => {
+      store.prices = store.prices.filter(
+        (r) => !(r.model_id === pair.model_id && r.supplier_id === pair.supplier_id),
+      );
+    }),
+    upsertSalePrice: vi.fn(async (row: { model_id: string; price: number }) => {
+      const i = store.sales.findIndex((s) => s.model_id === row.model_id);
+      if (i === -1) store.sales.push({ model_id: row.model_id, price: row.price });
+      else store.sales[i] = { model_id: row.model_id, price: row.price };
+    }),
+    deleteSalePrice: vi.fn(async (modelId: string) => {
+      store.sales = store.sales.filter((s) => s.model_id !== modelId);
+    }),
     extractQuote: vi.fn(async () => []),
-    applyQuoteEntry: vi.fn(async () => {}),
+    applyQuoteEntry: vi.fn(
+      async (modelId: string, supplierId: string, entry: { price: number; tiers: Array<{ min_qty: number; price: number }> }) => {
+        upsertStorePrice({ model_id: modelId, supplier_id: supplierId, price: entry.price });
+        replaceStoreTiers(
+          { model_id: modelId, supplier_id: supplierId },
+          entry.tiers.length > 1 ? entry.tiers : [],
+        );
+      },
+    ),
     queueCandidates: vi.fn(() => {}),
     ...stagingMock(),
     listKnowledge: async () => knowledgeRows.map((r) => ({ ...r })),
@@ -477,11 +535,14 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
     // nuevo → cola de confirmación (no se stagea)
     { rawName: "iPhone 18 Fold 1TB", supplier: "", price: 1500, tiers: [] },
   ];
-  const pricesRefs = async () => [
-    { model_id: "m1", supplier_id: "s-bax", price: 600, updated_at: new Date().toISOString() },
-    { model_id: "m1", supplier_id: "s-sou", price: 640, updated_at: new Date().toISOString() },
-    { model_id: "m2", supplier_id: "s-sou", price: 610, updated_at: new Date().toISOString() },
-  ];
+  const negotiationSeed = {
+    prices: [
+      { model_id: "m1", supplier_id: "s-bax", price: 600 },
+      { model_id: "m1", supplier_id: "s-sou", price: 640 },
+      { model_id: "m2", supplier_id: "s-sou", price: 610 },
+    ],
+    tiers: [],
+  };
 
   async function stageNegotiation(deps: ToolDeps) {
     return executeTool(
@@ -493,8 +554,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
   it("clasifica 🟢/🔴 contra la Mesa, encola lo nuevo y NO aplica", async () => {
     const deps = mockDeps({
       extractQuote: vi.fn(async () => quoteItems),
-      listPrices: pricesRefs,
-    });
+    }, negotiationSeed);
     const r = await stageNegotiation(deps);
     expect(r["proveedor"]).toBe("Bax");
     const resumen = r["resumen"] as Record<string, unknown>;
@@ -519,8 +579,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
   it("load_quote sigue funcionando como alias (mismo staging)", async () => {
     const deps = mockDeps({
       extractQuote: vi.fn(async () => [quoteItems[0]!]),
-      listPrices: pricesRefs,
-    });
+    }, negotiationSeed);
     const r = await executeTool({ name: "load_quote", args: { supplier: "Bax", text: "S26 585" } }, deps);
     expect((r["resumen"] as Record<string, unknown>)["oportunidades"]).toBe(1);
     expect(deps.getStaged()?.lines).toHaveLength(1);
@@ -529,8 +588,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
   it("apply_lines por clasificación aplica SOLO eso y lo saca de la mesa", async () => {
     const deps = mockDeps({
       extractQuote: vi.fn(async () => quoteItems),
-      listPrices: pricesRefs,
-    });
+    }, negotiationSeed);
     await stageNegotiation(deps);
     const r = await executeTool(
       { name: "apply_lines", args: { classification: "oportunidad" } },
@@ -552,8 +610,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
   it("apply_lines all + except ('todo menos el A17')", async () => {
     const deps = mockDeps({
       extractQuote: vi.fn(async () => quoteItems),
-      listPrices: pricesRefs,
-    });
+    }, negotiationSeed);
     await stageNegotiation(deps);
     const r = await executeTool(
       { name: "apply_lines", args: { all: true, except: ["A17"] } },
@@ -567,7 +624,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
     const deps = mockDeps();
     const sinStaging = await executeTool({ name: "apply_lines", args: { all: true } }, deps);
     expect(String(sinStaging["error"])).toMatch(/analyze_quote/);
-    const deps2 = mockDeps({ extractQuote: vi.fn(async () => quoteItems), listPrices: pricesRefs });
+    const deps2 = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, negotiationSeed);
     await stageNegotiation(deps2);
     const sinSelector = await executeTool({ name: "apply_lines", args: {} }, deps2);
     expect(String(sinSelector["error"])).toMatch(/QUÉ aplicar/);
@@ -575,7 +632,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
   });
 
   it("discard_lines all limpia la mesa sin aplicar", async () => {
-    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems), listPrices: pricesRefs });
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, negotiationSeed);
     await stageNegotiation(deps);
     const r = await executeTool({ name: "discard_lines", args: { all: true } }, deps);
     expect(r["descartadas"]).toBe(2);
@@ -584,7 +641,7 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
   });
 
   it("counter_offer: solo las 🔴, objetivo = nuestro mín (o mín−1), texto con números de la Mesa", async () => {
-    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems), listPrices: pricesRefs });
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, negotiationSeed);
     await stageNegotiation(deps);
     const r = await executeTool({ name: "counter_offer", args: {} }, deps);
     const lineas = r["lineas"] as Array<Record<string, unknown>>;
@@ -869,6 +926,236 @@ describe("Fase 8+ — cotización WhatsApp (formato del viejo)", () => {
     const r = await executeTool({ name: "whatsapp_list", args: { filter: "S26" } }, deps);
     expect(String(r["texto_whatsapp"])).toContain("S26");
     expect(String(r["texto_whatsapp"])).not.toContain("A17");
+  });
+});
+
+// ---------- P1: compliance del gate de escritura ----------
+
+describe("Gate P1 — applyGate (única definición de enforcement)", () => {
+  it("flags sin force → bloqueado; force o sin flags → pasa", () => {
+    const flags = [{ motivo: "x" }];
+    expect(applyGate(flags, false)).toEqual({ allowed: false, flags });
+    expect(applyGate(flags, true)).toEqual({ allowed: true });
+    expect(applyGate([], false)).toEqual({ allowed: true });
+  });
+});
+
+describe("Gate P1 — set_price gateado", () => {
+  it("precio con flag (unidad) → {bloqueado, flags} y CERO escrituras", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      { name: "set_price", args: { model: "S26 12+512 5G DS", supplier: "Bax", price: 61 } },
+      deps,
+    );
+    expect(r["bloqueado"]).toBe(true);
+    expect(String((r["flags"] as Array<{ motivo: string }>)[0]?.motivo)).toMatch(/unidad/);
+    expect(String(r["nota"])).toMatch(/NO escribí nada/);
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+    expect(deps.appendPriceHistory).not.toHaveBeenCalled();
+  });
+
+  it("force:true SIN reason → error y CERO escrituras", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      { name: "set_price", args: { model: "S26 12+512 5G DS", supplier: "Bax", price: 61, force: true } },
+      deps,
+    );
+    expect(String(r["error"])).toMatch(/reason/);
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+  });
+
+  it("force + reason del usuario → escribe, deja forzado.reason y verifica releyendo", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      {
+        name: "set_price",
+        args: {
+          model: "S26 12+512 5G DS",
+          supplier: "Bax",
+          price: 720,
+          force: true,
+          reason: "usuario confirma suba real por el dólar",
+        },
+      },
+      deps,
+    );
+    expect(r["ok"]).toBe(true);
+    expect((r["forzado"] as Record<string, unknown>)["reason"]).toMatch(/dólar/);
+    const verificacion = r["verificacion"] as { leido: Record<string, unknown>; coincide: boolean };
+    expect(verificacion.coincide).toBe(true);
+    expect(verificacion.leido["precio"]).toBe(720);
+    expect(deps.upsertPrice).toHaveBeenCalledTimes(1);
+  });
+
+  it("dry_run → simulación con 'escribiria' y CERO escrituras (aunque haya flags)", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      { name: "set_price", args: { model: "S26 12+512 5G DS", supplier: "Bax", price: 61, dry_run: true } },
+      deps,
+    );
+    expect(r["dry_run"]).toBe(true);
+    expect((r["escribiria"] as Record<string, unknown>)["precio"]).toBe(61);
+    expect(String(r["nota"])).toMatch(/BLOQUEADO/);
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+    expect(deps.appendPriceHistory).not.toHaveBeenCalled();
+  });
+
+  it("verify mismatch → error ruidoso con lo releído (la escritura no impactó)", async () => {
+    const deps = mockDeps({ upsertPrice: vi.fn(async () => {}) }); // write que NO impacta
+    const r = await executeTool(
+      { name: "set_price", args: { model: "S26 12+512 5G DS", supplier: "Bax", price: 630 } },
+      deps,
+    );
+    expect(String(r["error"])).toMatch(/verify-after-write/);
+    const verificacion = r["verificacion"] as { leido: Record<string, unknown>; coincide: boolean };
+    expect(verificacion.coincide).toBe(false);
+    expect(verificacion.leido["precio"]).toBe(600); // lo que hay de verdad
+  });
+});
+
+describe("Gate P1 — set_tiers / set_sale_price", () => {
+  it("escalera invertida → bloqueada sin escribir", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      {
+        name: "set_tiers",
+        args: {
+          model: "S26 12+512 5G DS",
+          supplier: "Bax",
+          tiers: [
+            { min_qty: 1, price: 595 },
+            { min_qty: 20, price: 620 },
+          ],
+        },
+      },
+      deps,
+    );
+    expect(r["bloqueado"]).toBe(true);
+    expect(String((r["flags"] as Array<{ motivo: string }>).map((f) => f.motivo).join(" "))).toMatch(
+      /escalera invertida/,
+    );
+    expect(deps.setTiersForPair).not.toHaveBeenCalled();
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+  });
+
+  it("set_tiers limpia escribe + verifica escalera Y precio de celda releídos", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      {
+        name: "set_tiers",
+        args: {
+          model: "S26 12+512 5G DS",
+          supplier: "Bax",
+          tiers: [
+            { min_qty: 1, price: 620 },
+            { min_qty: 50, price: 595 },
+          ],
+        },
+      },
+      deps,
+    );
+    expect(r["ok"]).toBe(true);
+    const verificacion = r["verificacion"] as { leido: Record<string, unknown>; coincide: boolean };
+    expect(verificacion.coincide).toBe(true);
+    expect(verificacion.leido["precio_celda"]).toBe(595);
+  });
+
+  it("set_tiers dry_run → cero escrituras", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      {
+        name: "set_tiers",
+        args: {
+          model: "S26 12+512 5G DS",
+          supplier: "Bax",
+          tiers: [{ min_qty: 1, price: 610 }],
+          dry_run: true,
+        },
+      },
+      deps,
+    );
+    expect(r["dry_run"]).toBe(true);
+    expect(deps.setTiersForPair).not.toHaveBeenCalled();
+  });
+
+  it("set_sale_price: dry_run no escribe; escribir y borrar verifican releyendo", async () => {
+    const deps = mockDeps();
+    const dry = await executeTool(
+      { name: "set_sale_price", args: { model: "A17 4+128 DS", price: 700, dry_run: true } },
+      deps,
+    );
+    expect(dry["dry_run"]).toBe(true);
+    expect(deps.upsertSalePrice).not.toHaveBeenCalled();
+    const set = await executeTool(
+      { name: "set_sale_price", args: { model: "A17 4+128 DS", price: 700 } },
+      deps,
+    );
+    expect((set["verificacion"] as { coincide: boolean }).coincide).toBe(true);
+    const del = await executeTool({ name: "set_sale_price", args: { model: "A17 4+128 DS" } }, deps);
+    expect((del["verificacion"] as { coincide: boolean; leido: Record<string, unknown> }).coincide).toBe(true);
+    expect((del["verificacion"] as { leido: Record<string, unknown> }).leido["lista"]).toBeNull();
+  });
+});
+
+describe("Gate P1 — apply_lines gatea POR LÍNEA (recalculado contra la Mesa actual)", () => {
+  const quoteItems = [
+    { rawName: "S26 12+512 5G DS", supplier: "", price: 585, tiers: [] }, // limpia
+    { rawName: "A17 4+128 DS", supplier: "", price: 6100, tiers: [] }, // flag unidad
+  ];
+  const seed = {
+    prices: [
+      { model_id: "m1", supplier_id: "s-bax", price: 600 },
+      { model_id: "m2", supplier_id: "s-sou", price: 610 },
+    ],
+    tiers: [],
+  };
+  const stage = async (deps: ToolDeps) =>
+    executeTool({ name: "analyze_quote", args: { supplier: "Bax", text: "lista" } }, deps);
+
+  it("sin force: la limpia se aplica (verificada), la flaggeada vuelve en 'bloqueadas' y sigue en la mesa", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, seed);
+    await stage(deps);
+    const r = await executeTool({ name: "apply_lines", args: { all: true } }, deps);
+    expect((r["aplicadas"] as unknown[]).length).toBe(1);
+    const bloqueadas = r["bloqueadas"] as Array<Record<string, unknown>>;
+    expect(bloqueadas).toHaveLength(1);
+    expect(bloqueadas[0]?.["modelo"]).toBe("A17 4+128 DS");
+    expect(deps.applyQuoteEntry).toHaveBeenCalledTimes(1);
+    expect(deps.getStaged()?.lines.map((l) => l.modelName)).toEqual(["A17 4+128 DS"]);
+    expect((r["verificacion"] as { coincide: boolean }).coincide).toBe(true);
+    expect(r["quedan_en_mesa"]).toBe(1);
+  });
+
+  it("force sin reason → error y nada aplicado", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, seed);
+    await stage(deps);
+    const r = await executeTool({ name: "apply_lines", args: { all: true, force: true } }, deps);
+    expect(String(r["error"])).toMatch(/reason/);
+    expect(deps.applyQuoteEntry).not.toHaveBeenCalled();
+  });
+
+  it("force + reason aplica también las flaggeadas y lo deja registrado", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, seed);
+    await stage(deps);
+    const r = await executeTool(
+      { name: "apply_lines", args: { all: true, force: true, reason: "usuario confirmó los 6100" } },
+      deps,
+    );
+    expect((r["aplicadas"] as unknown[]).length).toBe(2);
+    expect((r["bloqueadas"] as unknown[]).length).toBe(0);
+    expect((r["forzado"] as Record<string, unknown>)["reason"]).toMatch(/6100/);
+    expect(deps.getStaged()).toBeNull();
+  });
+
+  it("dry_run: simulación completa, staging intacto, cero escrituras", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, seed);
+    await stage(deps);
+    const r = await executeTool({ name: "apply_lines", args: { all: true, dry_run: true } }, deps);
+    expect(r["dry_run"]).toBe(true);
+    expect((r["aplicaria"] as unknown[]).length).toBe(1);
+    expect((r["bloqueadas"] as unknown[]).length).toBe(1);
+    expect(deps.applyQuoteEntry).not.toHaveBeenCalled();
+    expect(deps.getStaged()?.lines).toHaveLength(2);
   });
 });
 

@@ -35,7 +35,13 @@ import { resolveModel } from "../../domain/resolver";
 import type { ResolverRepo } from "../../domain/resolver";
 import type { QuoteEntry, QuoteTier } from "../../domain/quoteParser";
 import { listaPrice, whatsappQuoteText, type WhatsappGroup } from "../../domain/whatsapp";
-import { checkQuoteEntry, extractedToQuoteEntries, type ExtractedItem } from "./extraction";
+import {
+  applyGate,
+  checkQuoteEntry,
+  extractedToQuoteEntries,
+  type ExtractedItem,
+  type QuoteFlag,
+} from "./extraction";
 
 export type ToolCall = { name: string; args: Record<string, unknown> };
 export type ToolResult = Record<string, unknown>;
@@ -267,6 +273,76 @@ function sanitizeTierArgs(v: unknown): QuoteTier[] {
     .sort((a, b) => a.min_qty - b.min_qty);
 }
 
+// ---------- gate de escritura de precios (P1) ----------
+
+const flagOut = (f: QuoteFlag): Record<string, unknown> => ({
+  motivo: f.motivo,
+  ...(f.sugerencia !== undefined ? { sugerencia: f.sugerencia } : {}),
+});
+
+type GatedWrite = {
+  args: Record<string, unknown>;
+  flags: QuoteFlag[];
+  /** qué escribiría (para dry_run) */
+  simulacion: Record<string, unknown>;
+  write: () => Promise<void>;
+  /** releer tras mutar: verify-after-write */
+  verify: () => Promise<{ leido: Record<string, unknown>; coincide: boolean }>;
+  /** payload de éxito (se le suma verificacion/forzado) */
+  exito: Record<string, unknown>;
+};
+
+/**
+ * ÚNICO camino de escritura de precios de las tools (set_price / set_tiers /
+ * set_sale_price / apply_lines usa la misma semántica por línea):
+ *  - flags sin force → { bloqueado, flags, nota } SIN escribir (applyGate: una definición)
+ *  - force:true exige reason (la justificación del USUARIO; queda en el journal)
+ *  - dry_run:true → simulación sin NINGUNA escritura
+ *  - tras escribir SIEMPRE se relee: verificacion:{leido,coincide}; mismatch = error
+ */
+async function gatedPriceWrite(g: GatedWrite): Promise<ToolResult> {
+  const force = g.args["force"] === true;
+  const reason = typeof g.args["reason"] === "string" ? (g.args["reason"] as string).trim() : "";
+  const dryRun = g.args["dry_run"] === true;
+  if (force && reason === "") {
+    return {
+      error:
+        "force:true exige 'reason' (la justificación del USUARIO — pedísela, no la inventes). No escribí nada.",
+    };
+  }
+  if (dryRun) {
+    return {
+      dry_run: true,
+      escribiria: g.simulacion,
+      ...(g.flags.length > 0 ? { flags: g.flags.map(flagOut) } : {}),
+      ...(g.flags.length > 0 && !force
+        ? { nota: "Sin dry_run esto saldría BLOQUEADO por los flags." }
+        : {}),
+    };
+  }
+  const gate = applyGate(g.flags, force);
+  if (!gate.allowed) {
+    return {
+      bloqueado: true,
+      flags: gate.flags.map(flagOut),
+      nota: "NO escribí nada. Mostrale los flags al usuario y preguntá; re-llamá con force:true + reason SOLO con su OK explícito.",
+    };
+  }
+  await g.write();
+  const verificacion = await g.verify();
+  if (!verificacion.coincide) {
+    return {
+      error:
+        "verify-after-write falló: lo releído tras escribir NO coincide con lo pedido. Avisale al usuario y NO encadenes más escrituras.",
+      verificacion,
+    };
+  }
+  return { ...g.exito, verificacion, ...(force ? { forzado: { reason } } : {}) };
+}
+
+const sameTiers = (a: readonly QuoteTier[], b: readonly QuoteTier[]): boolean =>
+  a.length === b.length && a.every((t, i) => b[i]?.min_qty === t.min_qty && b[i]?.price === t.price);
+
 // ---------- ejecutor ----------
 
 /** Nombres que este ejecutor sabe correr (el test los cruza con TOOL_NAMES). */
@@ -408,20 +484,42 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
       const price = num(args, "price");
       if (price === null || price <= 0) return { error: "Falta un 'price' válido (> 0)." };
       const prices = await deps.listPrices();
-      const prev =
-        prices.find((p) => p.model_id === ref.modelId && p.supplier_id === sp.supplier.id)
-          ?.price ?? null;
+      const modelRows = prices.filter((p) => p.model_id === ref.modelId);
+      const prev = modelRows.find((p) => p.supplier_id === sp.supplier.id)?.price ?? null;
+      const modelMin = modelRows.length ? Math.min(...modelRows.map((p) => p.price)) : null;
+      const flags = checkQuoteEntry({ price, tiers: [] }, { pairPrice: prev, modelMin });
       const row = { model_id: ref.modelId, supplier_id: sp.supplier.id, price };
-      await deps.upsertPrice(row);
-      await deps.appendPriceHistory(row);
-      return {
-        ok: true,
-        modelo: ref.canonical,
-        proveedor: sp.supplier.name,
-        precio: price,
-        precio_anterior: prev,
-        variacion_pct: prev !== null && prev !== 0 ? +(((price - prev) / prev) * 100).toFixed(1) : null,
-      };
+      return gatedPriceWrite({
+        args,
+        flags,
+        simulacion: {
+          tool: "set_price",
+          modelo: ref.canonical,
+          proveedor: sp.supplier.name,
+          precio: price,
+          precio_anterior: prev,
+        },
+        write: async () => {
+          await deps.upsertPrice(row);
+          await deps.appendPriceHistory(row);
+        },
+        verify: async () => {
+          const after =
+            (await deps.listPrices()).find(
+              (p) => p.model_id === ref.modelId && p.supplier_id === sp.supplier.id,
+            )?.price ?? null;
+          return { leido: { precio: after }, coincide: after === price };
+        },
+        exito: {
+          ok: true,
+          modelo: ref.canonical,
+          proveedor: sp.supplier.name,
+          precio: price,
+          precio_anterior: prev,
+          variacion_pct:
+            prev !== null && prev !== 0 ? +(((price - prev) / prev) * 100).toFixed(1) : null,
+        },
+      });
     }
     case "set_tiers": {
       const ref = await resolveModelRef(deps, str(args, "model"));
@@ -430,32 +528,86 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
       if (!sp.ok) return sp.error;
       const tiers = sanitizeTierArgs(args["tiers"]);
       const pair = { model_id: ref.modelId, supplier_id: sp.supplier.id };
-      await deps.setTiersForPair(pair, tiers);
-      if (tiers.length > 0) {
-        // misma semántica que el parser: la celda muestra el mejor precio de la escalera
-        const best = Math.min(...tiers.map((t) => t.price));
-        await deps.upsertPrice({ ...pair, price: best });
-        await deps.appendPriceHistory({ ...pair, price: best });
-      }
-      return {
-        ok: true,
-        modelo: ref.canonical,
-        proveedor: sp.supplier.name,
-        escalones: tiers.length,
-        nota: tiers.length === 0 ? "Escalera borrada (quedó precio único)." : undefined,
-      };
+      const best = tiers.length > 0 ? Math.min(...tiers.map((t) => t.price)) : null;
+      const prices = await deps.listPrices();
+      const modelRows = prices.filter((p) => p.model_id === ref.modelId);
+      const prev = modelRows.find((p) => p.supplier_id === sp.supplier.id)?.price ?? null;
+      const modelMin = modelRows.length ? Math.min(...modelRows.map((p) => p.price)) : null;
+      // escalera invertida + sanidad del mejor precio, con el detector único
+      const flags =
+        best !== null
+          ? checkQuoteEntry({ price: best, tiers }, { pairPrice: prev, modelMin })
+          : [];
+      return gatedPriceWrite({
+        args,
+        flags,
+        simulacion: {
+          tool: "set_tiers",
+          modelo: ref.canonical,
+          proveedor: sp.supplier.name,
+          escalones: tiers,
+          precio_celda: best,
+        },
+        write: async () => {
+          await deps.setTiersForPair(pair, tiers);
+          if (best !== null) {
+            await deps.upsertPrice({ ...pair, price: best });
+            await deps.appendPriceHistory({ ...pair, price: best });
+          }
+        },
+        verify: async () => {
+          const after = (await deps.listTiers())
+            .filter((t) => t.model_id === ref.modelId && t.supplier_id === sp.supplier.id)
+            .map((t) => ({ min_qty: t.min_qty, price: t.price }))
+            .sort((a, b) => a.min_qty - b.min_qty);
+          const afterPrice =
+            (await deps.listPrices()).find(
+              (p) => p.model_id === ref.modelId && p.supplier_id === sp.supplier.id,
+            )?.price ?? null;
+          const coincide =
+            sameTiers(after, tiers) && (best === null || afterPrice === best);
+          return { leido: { escalones: after, precio_celda: afterPrice }, coincide };
+        },
+        exito: {
+          ok: true,
+          modelo: ref.canonical,
+          proveedor: sp.supplier.name,
+          escalones: tiers.length,
+          ...(tiers.length === 0 ? { nota: "Escalera borrada (quedó precio único)." } : {}),
+        },
+      });
     }
     case "set_sale_price": {
       const ref = await resolveModelRef(deps, str(args, "model"));
       if (!ref.ok) return ref.error;
       const price = num(args, "price");
-      if (price === null) {
-        await deps.deleteSalePrice(ref.modelId);
-        return { ok: true, modelo: ref.canonical, lista: "automática (Mín + margen)" };
+      if (price !== null && price <= 0) {
+        return { error: "El 'price' de Lista debe ser > 0 (u omitido para volver a automática)." };
       }
-      if (price <= 0) return { error: "El 'price' de Lista debe ser > 0 (u omitido)." };
-      await deps.upsertSalePrice({ model_id: ref.modelId, price, manual: true });
-      return { ok: true, modelo: ref.canonical, lista: price };
+      const readSale = async (): Promise<number | null> =>
+        (await deps.listSalePrices()).find((x) => x.model_id === ref.modelId)?.price ?? null;
+      return gatedPriceWrite({
+        args,
+        flags: [], // la Lista no tiene detector: gate transparente, pero con dry_run+verify
+        simulacion: {
+          tool: "set_sale_price",
+          modelo: ref.canonical,
+          lista: price ?? "automática (Mín + margen)",
+        },
+        write: async () => {
+          if (price === null) await deps.deleteSalePrice(ref.modelId);
+          else await deps.upsertSalePrice({ model_id: ref.modelId, price, manual: true });
+        },
+        verify: async () => {
+          const after = await readSale();
+          return { leido: { lista: after }, coincide: after === price };
+        },
+        exito: {
+          ok: true,
+          modelo: ref.canonical,
+          lista: price ?? "automática (Mín + margen)",
+        },
+      });
     }
     case "delete_price": {
       const ref = await resolveModelRef(deps, str(args, "model"));
@@ -598,15 +750,56 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
             "Decime QUÉ aplicar: models[…], category, classification ('oportunidad'|'en_linea'|'caro') o all:true (+except).",
         };
       }
-      const { selected, rest } = selectLines(staged.lines, sel);
+      const { selected } = selectLines(staged.lines, sel);
       if (selected.length === 0) {
         return {
           error: "Ningún renglón de la negociación matchea ese selector.",
           en_mesa: staged.lines.map((l) => `${l.modelName} (${l.analysis.clasificacion})`),
         };
       }
-      const advertencias: string[] = [];
-      for (const l of selected) {
+      const force = args["force"] === true;
+      const reason = typeof args["reason"] === "string" ? (args["reason"] as string).trim() : "";
+      const dryRun = args["dry_run"] === true;
+      if (force && reason === "") {
+        return {
+          error:
+            "force:true exige 'reason' (la justificación del USUARIO — pedísela, no la inventes). No escribí nada.",
+        };
+      }
+      // gate POR LÍNEA con flags RECALCULADOS contra la Mesa ACTUAL (server-of-truth:
+      // la Mesa pudo cambiar desde que se stageó la lista)
+      const pricesNow = await deps.listPrices();
+      const flagsOf = (l: StagedLine): QuoteFlag[] => {
+        const modelRows = pricesNow.filter((p) => p.model_id === l.modelId);
+        return checkQuoteEntry(
+          { price: l.price, tiers: l.tiers },
+          {
+            pairPrice: modelRows.find((p) => p.supplier_id === staged.supplierId)?.price ?? null,
+            modelMin: modelRows.length ? Math.min(...modelRows.map((p) => p.price)) : null,
+          },
+        );
+      };
+      const evaluated = selected.map((l) => ({ line: l, flags: flagsOf(l) }));
+      const bloqueadasEval = force ? [] : evaluated.filter((e) => e.flags.length > 0);
+      const aplicables = force ? evaluated : evaluated.filter((e) => e.flags.length === 0);
+      const bloqueadas = bloqueadasEval.map((e) => ({
+        modelo: e.line.modelName,
+        precio: e.line.price,
+        flags: e.flags.map(flagOut),
+      }));
+      if (dryRun) {
+        return {
+          dry_run: true,
+          aplicaria: aplicables.map((e) => ({ modelo: e.line.modelName, precio: e.line.price })),
+          bloqueadas,
+          quedan_en_mesa: staged.lines.length,
+          nota: "Simulación: no escribí nada y la mesa de negociación quedó intacta.",
+        };
+      }
+      const verifLineas: Array<Record<string, unknown>> = [];
+      let coincideTodo = true;
+      for (const e of aplicables) {
+        const l = e.line;
         await deps.applyQuoteEntry(l.modelId, staged.supplierId, {
           rawName: l.rawName,
           aliasKey: l.aliasKey,
@@ -614,20 +807,50 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
           tiers: l.tiers,
           lines: [l.rawName],
         });
-        for (const f of l.flags) advertencias.push(`${l.modelName}: ${f.motivo}`);
-      }
-      deps.removeStagedLines(selected.map((l) => l.aliasKey));
-      return {
-        proveedor: staged.supplierName,
-        aplicadas: selected.map((l) => ({
+        // verify-after-write por línea: releer el par recién escrito
+        const after = (await deps.listPrices()).find(
+          (p) => p.model_id === l.modelId && p.supplier_id === staged.supplierId,
+        );
+        const afterTiers = (await deps.listTiers()).filter(
+          (t) => t.model_id === l.modelId && t.supplier_id === staged.supplierId,
+        );
+        const coincide =
+          after?.price === l.price && afterTiers.length === (l.tiers.length > 1 ? l.tiers.length : 0);
+        if (!coincide) coincideTodo = false;
+        verifLineas.push({
           modelo: l.modelName,
-          precio: l.price,
-          clasificacion: l.analysis.clasificacion,
-          ...(l.tiers.length > 1 ? { escalones: l.tiers.length } : {}),
+          leido: { precio: after?.price ?? null, escalones: afterTiers.length },
+          coincide,
+        });
+      }
+      deps.removeStagedLines(aplicables.map((e) => e.line.aliasKey));
+      const base = {
+        proveedor: staged.supplierName,
+        aplicadas: aplicables.map((e) => ({
+          modelo: e.line.modelName,
+          precio: e.line.price,
+          clasificacion: e.line.analysis.clasificacion,
+          ...(e.line.tiers.length > 1 ? { escalones: e.line.tiers.length } : {}),
         })),
-        ...(advertencias.length ? { advertencias } : {}),
-        quedan_en_mesa: rest.length,
+        bloqueadas,
+        ...(bloqueadas.length > 0
+          ? {
+              nota_bloqueadas:
+                "Las bloqueadas NO se escribieron y siguen en la mesa: mostrá los flags y preguntá; force:true + reason solo con OK explícito.",
+            }
+          : {}),
+        quedan_en_mesa: staged.lines.length - aplicables.length,
+        verificacion: { lineas: verifLineas, coincide: coincideTodo },
+        ...(force ? { forzado: { reason } } : {}),
       };
+      if (!coincideTodo) {
+        return {
+          ...base,
+          error:
+            "verify-after-write falló en al menos una línea: lo releído no coincide. Avisale al usuario y NO encadenes más escrituras.",
+        };
+      }
+      return base;
     }
     case "discard_lines": {
       const staged = deps.getStaged();

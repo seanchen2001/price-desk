@@ -13,6 +13,17 @@ type Declaration = {
 const STR = (description: string) => ({ type: "STRING", description });
 const NUM = (description: string) => ({ type: "NUMBER", description });
 
+const BOOL = (description: string) => ({ type: "BOOLEAN", description });
+
+// params del gate (P1) — compartidos por las tools de precio
+const GATE_PARAMS = {
+  force: BOOL(
+    "SOLO tras un bloqueo y con OK explícito del usuario. NO la uses de entrada ni la inventes.",
+  ),
+  reason: STR("Obligatoria con force: la justificación DEL USUARIO (queda en el journal)."),
+  dry_run: BOOL("true = simular sin escribir nada (devuelve 'escribiria')."),
+};
+
 const MODEL_PARAM = STR(
   "Nombre del modelo tal cual lo conocés (se resuelve con el resolvedor de identidad; si no existe, la tool lo dice — no se crea nada solo).",
 );
@@ -97,13 +108,14 @@ const DECLARATIONS: Declaration[] = [
   {
     name: "set_price",
     description:
-      "Carga/actualiza el precio de UN modelo para UN proveedor (upsert por fila + historial). Devuelve el precio anterior y la variación.",
+      "Carga/actualiza el precio de UN modelo para UN proveedor (upsert por fila + historial + verificación releída). GATEADA: si el precio dispara flags (unidad, >±30% vs Mín, >±15% vs par) devuelve {bloqueado, flags} SIN escribir. CUÁNDO NO USARLA: para listas de varios modelos usá analyze_quote→apply_lines; para escaleras usá set_tiers.",
     parameters: {
       type: "OBJECT",
       properties: {
         model: MODEL_PARAM,
         supplier: STR("Proveedor del precio."),
         price: NUM("Precio en USD."),
+        ...GATE_PARAMS,
       },
       required: ["model", "supplier", "price"],
     },
@@ -111,7 +123,7 @@ const DECLARATIONS: Declaration[] = [
   {
     name: "set_tiers",
     description:
-      "Define la escalera por cantidad de UN par modelo+proveedor (reemplaza la escalera de ESE par; [] la borra). La fila sigue siendo UNA: las cantidades jamás crean filas.",
+      "Define la escalera por cantidad de UN par modelo+proveedor (reemplaza la escalera de ESE par; [] la borra; verificación releída). GATEADA: escalera invertida o mejor-precio insano → {bloqueado, flags} sin escribir. La fila sigue siendo UNA: las cantidades jamás crean filas. CUÁNDO NO USARLA: si no te pasaron escalones explícitos.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -126,6 +138,7 @@ const DECLARATIONS: Declaration[] = [
             required: ["min_qty", "price"],
           },
         },
+        ...GATE_PARAMS,
       },
       required: ["model", "supplier", "tiers"],
     },
@@ -133,10 +146,14 @@ const DECLARATIONS: Declaration[] = [
   {
     name: "set_sale_price",
     description:
-      "Fija la Lista (precio de venta manual) de un modelo. Sin 'price' → vuelve a automática (Mín + margen).",
+      "Fija la Lista (precio de venta manual) de un modelo, con verificación releída. Sin 'price' → vuelve a automática (Mín + margen). Acepta dry_run. CUÁNDO NO USARLA: no toca costos de proveedor (eso es set_price).",
     parameters: {
       type: "OBJECT",
-      properties: { model: MODEL_PARAM, price: NUM("Precio de Lista en USD (omitir = automática).") },
+      properties: {
+        model: MODEL_PARAM,
+        price: NUM("Precio de Lista en USD (omitir = automática)."),
+        dry_run: GATE_PARAMS.dry_run,
+      },
       required: ["model"],
     },
   },
@@ -166,7 +183,7 @@ const DECLARATIONS: Declaration[] = [
   {
     name: "apply_lines",
     description:
-      "Aplica SELECTIVAMENTE líneas de la negociación en curso a la Mesa (precio+escala por fila). Selector: models[] (nombres), category, classification ('oportunidad'|'en_linea'|'caro') o all:true — combinable con except[] ('todo menos X'). Lo aplicado sale de la mesa de negociación; el resto queda. Solo por instrucción explícita del usuario.",
+      "Aplica SELECTIVAMENTE líneas de la negociación en curso a la Mesa (precio+escala por fila, con verificación releída por línea). Selector: models[] (nombres), category, classification ('oportunidad'|'en_linea'|'caro') o all:true — combinable con except[] ('todo menos X'). GATEADA POR LÍNEA contra la Mesa ACTUAL: las limpias se aplican, las flaggeadas vuelven en 'bloqueadas' y siguen en la mesa. Solo por instrucción explícita del usuario. CUÁNDO NO USARLA: sin analyze_quote previo no hay nada stageado.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -175,6 +192,7 @@ const DECLARATIONS: Declaration[] = [
         classification: STR("'oportunidad' | 'en_linea' | 'caro'."),
         all: { type: "BOOLEAN", description: "true = todas las líneas stageadas." },
         except: { type: "ARRAY", items: { type: "STRING" }, description: "Excluir estos modelos." },
+        ...GATE_PARAMS,
       },
     },
   },
@@ -372,6 +390,16 @@ export function buildAgentSystem(ctx: AgentSystemContext): string {
     "PODÉS (CRUD completo, dinámico): crear modelos y proveedores nuevos, crear/renombrar categorías (ej. separar 'Samsung Gama Alta' y 'Samsung Gama Baja' y mover los modelos con move_model_category — la grilla las muestra como secciones separadas), cargar precios y escaleras por cantidad, fijar la Lista.",
     "",
     "CONFIRMACIONES: delete_price y toggle_supplier son destructivas → la UI le pide confirmación al usuario antes de ejecutarlas; avisá que quedó a la espera si el resultado dice cancelado/confirmación. El resto se ejecuta directo.",
+    "",
+    "CONTRATO DEL GATE (escrituras de precio — set_price/set_tiers/apply_lines):",
+    "- Si la tool devuelve {bloqueado:true, flags}: NO escribió NADA. Mostrale los flags AL USUARIO tal cual y preguntá. Re-llamá con force:true + reason ÚNICAMENTE con su OK explícito. JAMÁS fuerces por tu cuenta ni inventes el reason (es la justificación del usuario, textual).",
+    "- force sin reason = error. dry_run:true simula sin escribir ('a ver qué pasaría').",
+    "- COHERENCIA POST-MUTACIÓN: toda escritura devuelve verificacion:{leido,coincide} (releído de la base). Si coincide:false, avisá el mismatch y FRENÁ: no encadenes más escrituras en ese turno.",
+    "- En apply_lines las líneas 'bloqueadas' siguen en la mesa de negociación: no las des por aplicadas.",
+    "EJEMPLOS (secuencias correctas):",
+    "  · user: 'cargá el S26 a 61 de Bax' → set_price(61) → {bloqueado, flags:[~1/10 del mín $610]} → vos: '🚩 61 parece 1/10 del mín ($610), ¿era 610?' → user: 'sí, 610' → set_price(610) — SIN force: el precio corregido pasa limpio.",
+    "  · user: 'cargá 720, sé que subió' → set_price(720) → {bloqueado, flags:[+20% vs par]} → vos preguntás → user: 'sí, forzalo: subió por el dólar' → set_price(720, force:true, reason:'usuario confirma suba real por el dólar').",
+    "  · user: '¿qué pasaría si aplico toda la lista?' → apply_lines(all:true, dry_run:true) → mostrás aplicaria/bloqueadas sin tocar nada.",
     "",
     "CONTEXTO ACTUAL:",
     `- Departamentos: ${ctx.departments.join(", ") || "(ninguno)"}.`,

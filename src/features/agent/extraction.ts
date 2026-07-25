@@ -262,6 +262,20 @@ export function checkQuoteEntry(
   return flags;
 }
 
+export type GateResult = { allowed: true } | { allowed: false; flags: QuoteFlag[] };
+
+/**
+ * EL gate de escritura de precios (P1) — la ÚNICA definición de enforcement, pegada al
+ * detector único (checkQuoteEntry). Flags sin force → bloqueado (quien llama NO debe
+ * escribir); force=true (con reason del USUARIO, exigido por el caller) pasa.
+ * Lo usan las tools de precio del executor; la UI (PastePanel) ya aplica la misma
+ * semántica auto/review con estos mismos flags.
+ */
+export function applyGate(flags: readonly QuoteFlag[], force: boolean): GateResult {
+  if (flags.length === 0 || force) return { allowed: true };
+  return { allowed: false, flags: [...flags] };
+}
+
 /** % de variación vs el precio actual; null si no hay precio previo (→ auto-aplicable). */
 export function deltaPct(oldPrice: number | null, newPrice: number): number | null {
   if (oldPrice === null || oldPrice === 0) return null;
