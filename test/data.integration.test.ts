@@ -7,54 +7,18 @@
 // importan DINÁMICAMENTE dentro del describe para no evaluar src/data/supabase.ts
 // (que exige las env vars) durante la colección.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import type { WebSocketLike, WebSocketLikeConstructor } from "@supabase/realtime-js";
+import { installWebSocketStub } from "../scripts/lib/db";
+import { loadDeskEnv } from "../scripts/lib/env";
 import type { Database } from "../src/data/database.types";
 import type { Db } from "../src/data/supabase";
 
 // Este test NO usa Realtime, pero createClient exige un WebSocket en el entorno
 // (Node < 22 no trae uno nativo). Stub tipado, jamás se conecta; se registra como
 // global ANTES de importar src/data/ (cuyo cliente compartido también lo exige).
-class StubWebSocket implements WebSocketLike {
-  readonly CONNECTING = 0;
-  readonly OPEN = 1;
-  readonly CLOSING = 2;
-  readonly CLOSED = 3;
-  readonly readyState = 3;
-  readonly url = "";
-  readonly protocol = "";
-  onopen: WebSocketLike["onopen"] = null;
-  onmessage: WebSocketLike["onmessage"] = null;
-  onclose: WebSocketLike["onclose"] = null;
-  onerror: WebSocketLike["onerror"] = null;
-  close(): void {}
-  send(): void {}
-  addEventListener(): void {}
-  removeEventListener(): void {}
-}
-const stubTransport: WebSocketLikeConstructor = StubWebSocket;
-(globalThis as { WebSocket?: unknown }).WebSocket ??= stubTransport;
+installWebSocketStub();
 
-function loadEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  const envPath = fileURLToPath(new URL("../.env", import.meta.url));
-  if (existsSync(envPath)) {
-    for (const line of readFileSync(envPath, "utf8").split("\n")) {
-      const i = line.indexOf("=");
-      if (i > 0 && !line.trim().startsWith("#")) {
-        out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-      }
-    }
-  }
-  for (const k of ["VITE_SUPABASE_URL", "SUPABASE_SERVICE_KEY"]) {
-    const v = process.env[k];
-    if (v && !out[k]) out[k] = v;
-  }
-  return out;
-}
 
-const env = loadEnv();
+const env = loadDeskEnv();
 const url = env["VITE_SUPABASE_URL"] ?? "";
 const serviceKey = env["SUPABASE_SERVICE_KEY"] ?? "";
 const hasEnv = url !== "" && serviceKey !== "";
@@ -80,7 +44,6 @@ describe.skipIf(!hasEnv)("Fase 4 — capa de datos: dos clientes contra Supabase
     const { createClient } = await import("@supabase/supabase-js");
     const opts = {
       auth: { persistSession: false, autoRefreshToken: false },
-      realtime: { transport: stubTransport },
     };
     A = createClient<Database>(url, serviceKey, opts);
     B = createClient<Database>(url, serviceKey, opts);

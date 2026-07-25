@@ -17,7 +17,8 @@
 //   categories → departments → knowledge → chat_log → drafts
 
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { loadDeskEnv } from "./lib/env";
+import { writeFileSync } from "node:fs";
 import { computeAccounts, type Side } from "../src/domain/accounts";
 import { normalize } from "../src/domain/normalize";
 import { dmyToISO } from "../src/domain/orders";
@@ -153,15 +154,6 @@ type OldKv = {
 };
 
 // ---------- env + REST (PostgREST directo; sin supabase-js para no arrastrar websockets) ----------
-function loadEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const line of readFileSync(new URL("../.env", import.meta.url), "utf8").split("\n")) {
-    const t = line.trim();
-    if (!t || t.startsWith("#") || !t.includes("=")) continue;
-    out[t.slice(0, t.indexOf("=")).trim()] = t.slice(t.indexOf("=") + 1).trim();
-  }
-  return out;
-}
 
 type Rest = {
   get: <T>(path: string) => Promise<T>;
@@ -290,7 +282,7 @@ async function main(): Promise<void> {
   const wipe = args.has("--wipe");
   const yesWipe = args.has("--yes-wipe");
 
-  const env = loadEnv();
+  const env = loadDeskEnv();
   const need = (k: string): string => {
     const v = env[k];
     if (!v) throw new Error(`Falta ${k} en .env`);

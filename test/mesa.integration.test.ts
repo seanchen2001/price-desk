@@ -10,54 +10,18 @@
 // reutilizan si existen (solo se les agregan precios de modelos del test, que caen con
 // el cascade del modelo).
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import type { WebSocketLike, WebSocketLikeConstructor } from "@supabase/realtime-js";
+import { installWebSocketStub } from "../scripts/lib/db";
+import { loadDeskEnv } from "../scripts/lib/env";
 import type { Database } from "../src/data/database.types";
 import type { Db } from "../src/data/supabase";
 import { parseQuoteText } from "../src/domain/quoteParser";
 import { normalize } from "../src/domain/normalize";
 
 // createClient exige un WebSocket en el entorno (Node < 22); stub tipado, jamás conecta.
-class StubWebSocket implements WebSocketLike {
-  readonly CONNECTING = 0;
-  readonly OPEN = 1;
-  readonly CLOSING = 2;
-  readonly CLOSED = 3;
-  readonly readyState = 3;
-  readonly url = "";
-  readonly protocol = "";
-  onopen: WebSocketLike["onopen"] = null;
-  onmessage: WebSocketLike["onmessage"] = null;
-  onclose: WebSocketLike["onclose"] = null;
-  onerror: WebSocketLike["onerror"] = null;
-  close(): void {}
-  send(): void {}
-  addEventListener(): void {}
-  removeEventListener(): void {}
-}
-const stubTransport: WebSocketLikeConstructor = StubWebSocket;
-(globalThis as { WebSocket?: unknown }).WebSocket ??= stubTransport;
+installWebSocketStub();
 
-function loadEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  const envPath = fileURLToPath(new URL("../.env", import.meta.url));
-  if (existsSync(envPath)) {
-    for (const line of readFileSync(envPath, "utf8").split("\n")) {
-      const i = line.indexOf("=");
-      if (i > 0 && !line.trim().startsWith("#")) {
-        out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-      }
-    }
-  }
-  for (const k of ["VITE_SUPABASE_URL", "SUPABASE_SERVICE_KEY"]) {
-    const v = process.env[k];
-    if (v && !out[k]) out[k] = v;
-  }
-  return out;
-}
 
-const env = loadEnv();
+const env = loadDeskEnv();
 const url = env["VITE_SUPABASE_URL"] ?? "";
 const serviceKey = env["SUPABASE_SERVICE_KEY"] ?? "";
 const hasEnv = url !== "" && serviceKey !== "";

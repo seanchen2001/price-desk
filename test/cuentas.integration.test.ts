@@ -9,9 +9,8 @@
 // Parte 2: contra el Supabase REAL (service key) escribiendo por la capa de datos —
 // se SKIPEA sin .env, igual que data.integration.test.ts.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import type { WebSocketLike, WebSocketLikeConstructor } from "@supabase/realtime-js";
+import { installWebSocketStub } from "../scripts/lib/db";
+import { loadDeskEnv } from "../scripts/lib/env";
 import type { Database } from "../src/data/database.types";
 import type { Db } from "../src/data/supabase";
 import { computeAccounts } from "../src/domain/accounts";
@@ -118,45 +117,10 @@ describe("Fase 7 — cableado data→domain de Cuentas (puro, escenario conocido
 
 // ---------- Parte 2: mismo escenario contra el Supabase real (service key) ----------
 
-class StubWebSocket implements WebSocketLike {
-  readonly CONNECTING = 0;
-  readonly OPEN = 1;
-  readonly CLOSING = 2;
-  readonly CLOSED = 3;
-  readonly readyState = 3;
-  readonly url = "";
-  readonly protocol = "";
-  onopen: WebSocketLike["onopen"] = null;
-  onmessage: WebSocketLike["onmessage"] = null;
-  onclose: WebSocketLike["onclose"] = null;
-  onerror: WebSocketLike["onerror"] = null;
-  close(): void {}
-  send(): void {}
-  addEventListener(): void {}
-  removeEventListener(): void {}
-}
-const stubTransport: WebSocketLikeConstructor = StubWebSocket;
-(globalThis as { WebSocket?: unknown }).WebSocket ??= stubTransport;
+installWebSocketStub();
 
-function loadEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  const envPath = fileURLToPath(new URL("../.env", import.meta.url));
-  if (existsSync(envPath)) {
-    for (const line of readFileSync(envPath, "utf8").split("\n")) {
-      const i = line.indexOf("=");
-      if (i > 0 && !line.trim().startsWith("#")) {
-        out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-      }
-    }
-  }
-  for (const k of ["VITE_SUPABASE_URL", "SUPABASE_SERVICE_KEY"]) {
-    const v = process.env[k];
-    if (v && !out[k]) out[k] = v;
-  }
-  return out;
-}
 
-const env = loadEnv();
+const env = loadDeskEnv();
 const url = env["VITE_SUPABASE_URL"] ?? "";
 const serviceKey = env["SUPABASE_SERVICE_KEY"] ?? "";
 const hasEnv = url !== "" && serviceKey !== "";
@@ -179,7 +143,6 @@ describe.skipIf(!hasEnv)("Fase 7 — cuentas corrientes contra Supabase real", (
     const { createClient } = await import("@supabase/supabase-js");
     db = createClient<Database>(url, serviceKey, {
       auth: { persistSession: false, autoRefreshToken: false },
-      realtime: { transport: stubTransport },
     });
     clientsMod = await import("../src/data/clients");
     suppliersMod = await import("../src/data/suppliers");

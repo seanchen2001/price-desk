@@ -10,9 +10,8 @@
 //   3) flujo ejecutado real: create_category + move_model_category contra la base
 //      (queda como demo coherente: el S26 en "Samsung Gama Alta")
 import { describe, expect, it } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { forwardGemini } from "../api/_geminiCore";
+import { loadDeskEnv } from "../scripts/lib/env";
 import { normalize } from "../src/domain/normalize";
 import {
   buildExtractionSystem,
@@ -23,25 +22,8 @@ import {
 import type { GeminiContent, GeminiFunctionCall, GeminiPart } from "../src/features/agent/gemini";
 import { AGENT_TOOLS, buildAgentSystem } from "../src/features/agent/tools";
 
-function loadEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  const envPath = fileURLToPath(new URL("../.env", import.meta.url));
-  if (existsSync(envPath)) {
-    for (const line of readFileSync(envPath, "utf8").split("\n")) {
-      const i = line.indexOf("=");
-      if (i > 0 && !line.trim().startsWith("#")) {
-        out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-      }
-    }
-  }
-  for (const k of ["GEMINI_API_KEY", "VITE_SUPABASE_URL", "SUPABASE_SERVICE_KEY"]) {
-    const v = process.env[k];
-    if (v && !out[k]) out[k] = v;
-  }
-  return out;
-}
 
-const env = loadEnv();
+const env = loadDeskEnv();
 const KEY = env["GEMINI_API_KEY"] ?? "";
 const LIVE = process.env["GEMINI_LIVE"] === "1" && KEY !== "";
 const HAS_DB = (env["VITE_SUPABASE_URL"] ?? "") !== "" && (env["SUPABASE_SERVICE_KEY"] ?? "") !== "";
@@ -265,18 +247,11 @@ describe.skipIf(!LIVE || !HAS_DB)("Fase 8 — flujo EJECUTADO real: create_categ
   it(
     "crea 'Samsung Gama Alta' y mueve el S26 (queda como demo coherente)",
     async () => {
-      // stub de WebSocket para createClient en Node (igual que mesa.integration)
-      (globalThis as { WebSocket?: unknown }).WebSocket ??= class {
-        close(): void {}
-        send(): void {}
-        addEventListener(): void {}
-        removeEventListener(): void {}
-      };
-      const { createClient } = await import("@supabase/supabase-js");
+      const { makeServiceDb } = await import("../scripts/lib/db");
       const { buildLiveDeps } = await import("../src/features/agent/liveDeps");
       const { executeTool } = await import("../src/features/agent/executor");
-      const db = createClient(env["VITE_SUPABASE_URL"]!, env["SUPABASE_SERVICE_KEY"]!);
-      const deps = buildLiveDeps(db as never);
+      const db = makeServiceDb(env);
+      const deps = buildLiveDeps(db);
 
       const created = await executeTool(
         { name: "create_category", args: { name: "Samsung Gama Alta" } },
