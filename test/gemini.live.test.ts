@@ -243,6 +243,43 @@ describe.skipIf(!LIVE)("Negociador REAL — analyze → apply parcial → counte
   );
 });
 
+describe.skipIf(!LIVE)("P4 — triage QA real: anti-alucinación (ids ⊆ input)", () => {
+  it(
+    "el LLM prioriza SOLO ids provistos; los inventados se filtran",
+    async () => {
+      const { triageQaFindings } = await import("../scripts/lib/qa-task");
+      const { makeDirectGeminiFetch } = await import("../scripts/lib/gemini");
+      const findings = [
+        {
+          id: "lista_below_cost:mLB",
+          tipo: "lista_below_cost" as const,
+          severidad: "critico" as const,
+          modelo: "ListaBaja 8+256",
+          detalle: "Lista $150 DEBAJO del mejor costo $200",
+        },
+        {
+          id: "stale:spStale",
+          tipo: "stale" as const,
+          severidad: "bajo" as const,
+          proveedor: "Viejo",
+          detalle: "2 precios vencidos",
+        },
+      ];
+      const triage = await triageQaFindings(findings, makeDirectGeminiFetch(KEY));
+      expect(triage.resumen.length).toBeGreaterThan(10);
+      expect(triage.prioridades.length).toBeGreaterThan(0);
+      const validIds = new Set(findings.map((f) => f.id));
+      for (const p of triage.prioridades) {
+        expect(validIds.has(p.id), `id alucinado: ${p.id}`).toBe(true);
+      }
+      // lo crítico debería venir priorizado arriba
+      const lb = triage.prioridades.find((p) => p.id === "lista_below_cost:mLB");
+      expect(lb?.prioridad).toBe(1);
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(!LIVE || !HAS_DB)("Fase 8 — flujo EJECUTADO real: create_category + move", () => {
   it(
     "crea 'Samsung Gama Alta' y mueve el S26 (queda como demo coherente)",

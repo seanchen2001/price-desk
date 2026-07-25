@@ -28,6 +28,7 @@ import {
 import { buildServerDeps } from "../src/features/agent/serverDeps";
 import { buildAgentSystem } from "../src/features/agent/tools";
 import { makeServiceDb } from "./lib/db";
+import { runQaTask } from "./lib/qa-task";
 import { loadDeskEnv } from "./lib/env";
 import { makeDirectGeminiFetch } from "./lib/gemini";
 
@@ -80,7 +81,28 @@ async function main(): Promise<void> {
   console.log(`— agente autónomo · task=${task} · mode=${mode} —`);
 
   if (task === "qa") {
-    throw new Error("--task=qa llega con P4 (QA de precios)"); // P3: solo chat
+    const out = await runQaTask({ db, deps, fetchFn, policy, journal });
+    const runId = await persistRun(db, {
+      task: "qa",
+      mode,
+      status: out.status,
+      findings: out.findings as unknown as Json,
+      actions: { journal, fixes: out.fixes, candidatos } as unknown as Json,
+      report: out.report,
+      metrics: out.metrics as unknown as Json,
+    });
+    await appendChatLog(
+      {
+        user_text: `[agente autónomo] QA de precios (${mode})`,
+        actions: { runId, fixes: out.fixes } as unknown as Json,
+        final_text: out.report,
+      },
+      db,
+    );
+    console.log("\n================ REPORTE QA ================\n");
+    console.log(out.report);
+    console.log(`\nrun_id: ${runId ?? "(no persistido)"} · status: ${out.status}`);
+    return;
   }
 
   const prompt = arg("prompt") ?? "";
