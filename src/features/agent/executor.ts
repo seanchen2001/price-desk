@@ -13,19 +13,29 @@ import {
   type DeskInvoice,
   type PnlPeriod,
 } from "../../domain/analytics";
-import { bestSuppliers, type PriceMatrix, type TierMatrix } from "../../domain/planning";
-import { rowAggregates } from "../../domain/pricing";
+import {
+  analyzeOffer,
+  counterOffer,
+  discountPlan,
+  encodeNote,
+  negotiationSummary,
+  recallNotes,
+  selectLines,
+  type DiscountInput,
+  type LineSelector,
+  type OfferClass,
+  type PriceRef,
+  type StagedLine,
+  type StagedNegotiation,
+} from "../../domain/negotiation";
+import { bestSuppliers, costForQty, type PriceMatrix, type TierMatrix } from "../../domain/planning";
+import { classifyFreshness, rowAggregates } from "../../domain/pricing";
 import { clientPulse, type PulseClient, type PulseOps } from "../../domain/pulse";
 import { resolveModel } from "../../domain/resolver";
 import type { ResolverRepo } from "../../domain/resolver";
 import type { QuoteEntry, QuoteTier } from "../../domain/quoteParser";
 import { listaPrice, whatsappQuoteText, type WhatsappGroup } from "../../domain/whatsapp";
-import {
-  checkQuoteEntry,
-  extractedToQuoteEntries,
-  PRICE_AUTO_THRESHOLD,
-  type ExtractedItem,
-} from "./extraction";
+import { checkQuoteEntry, extractedToQuoteEntries, type ExtractedItem } from "./extraction";
 
 export type ToolCall = { name: string; args: Record<string, unknown> };
 export type ToolResult = Record<string, unknown>;
@@ -93,6 +103,14 @@ export type ToolDeps = {
   queueCandidates: (
     items: Array<{ entry: QuoteEntry; aliasKey: string; supplierId: string; supplierName: string }>,
   ) => void;
+  // staging de negociación (persistido; visible en la Mesa)
+  getStaged: () => StagedNegotiation | null;
+  setStaged: (neg: StagedNegotiation) => void;
+  removeStagedLines: (aliasKeys: readonly string[]) => void;
+  clearStaged: () => void;
+  // memoria del negociador (tabla knowledge)
+  listKnowledge: () => Promise<Array<{ id: string; rule_text: string }>>;
+  insertKnowledge: (ruleText: string) => Promise<void>;
 };
 
 // ---------- matching difuso de proveedor (case/typos → propone, JAMÁS crea) ----------
@@ -157,6 +175,11 @@ const num = (args: Record<string, unknown>, key: string): number | null => {
   const v = args[key];
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 };
+
+const strArr = (args: Record<string, unknown>, key: string): string[] =>
+  Array.isArray(args[key])
+    ? (args[key] as unknown[]).filter((x): x is string => typeof x === "string" && x.trim() !== "")
+    : [];
 
 const ci = (s: string): string => s.trim().toLowerCase();
 
@@ -264,7 +287,15 @@ export const EXECUTABLE_TOOLS: ReadonlySet<string> = new Set([
   "analytics_summary",
   "cuentas_summary",
   "best_suppliers",
-  "load_quote",
+  "load_quote", // alias legado de analyze_quote
+  "analyze_quote",
+  "apply_lines",
+  "discard_lines",
+  "counter_offer",
+  "price_position",
+  "discount_plan",
+  "remember",
+  "recall",
   "whatsapp_list",
 ]);
 
@@ -434,11 +465,11 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
       await deps.deletePrice({ model_id: ref.modelId, supplier_id: sp.supplier.id });
       return { ok: true, borrado: `${ref.canonical} @ ${sp.supplier.name}` };
     }
+    case "analyze_quote":
     case "load_quote": {
-      // La lista pegada EN EL CHAT entra a la MISMA tubería propose-only de la Mesa:
-      // extracción Gemini → resolveModel → checks determinísticos → auto-aplica solo lo
-      // sano (≤±15% vs par, sin flags de sanidad) → candidatos NUEVOS a la cola de
-      // confirmación de la Mesa. La IA jamás crea catálogo.
+      // La lista pegada = MESA DE NEGOCIACIÓN: se extrae + resuelve (misma tubería
+      // propose-only) y se STAGEA con el análisis por línea contra la Mesa actual.
+      // NO se aplica NADA acá — aplicar es apply_lines (selectivo, por instrucción).
       const text = str(args, "text");
       if (!text) return { error: "Falta 'text' (pegá la lista cruda del proveedor)." };
       const sp = await resolveSupplierRef(deps, str(args, "supplier"));
@@ -448,22 +479,26 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
         return { error: "La IA no encontró ningún producto con precio en el texto." };
       }
       const entries = extractedToQuoteEntries(items);
-      const [repo, models, prices] = await Promise.all([
+      const [repo, models, prices, categories, suppliers] = await Promise.all([
         deps.resolver(),
         deps.listModels(),
         deps.listPrices(),
+        deps.listCategories(),
+        deps.listSuppliers(),
       ]);
-      const nameById = new Map(models.map((m) => [m.id, m.canonical_name]));
-      const minByModel = new Map<string, number>();
-      const pairPrice = new Map<string, number>();
-      for (const p of prices) {
-        const cur = minByModel.get(p.model_id);
-        if (cur === undefined || p.price < cur) minByModel.set(p.model_id, p.price);
-        pairPrice.set(`${p.model_id}:${p.supplier_id}`, p.price);
+      const modelById = new Map(models.map((m) => [m.id, m]));
+      const catNameById = new Map(categories.map((c) => [c.id, c.name]));
+      const supplierNameById = new Map(suppliers.map((x) => [x.id, x.name]));
+      const refsByModel = new Map<string, PriceRef[]>();
+      for (const pr of prices) {
+        (refsByModel.get(pr.model_id) ?? refsByModel.set(pr.model_id, []).get(pr.model_id)!).push({
+          supplierId: pr.supplier_id,
+          price: pr.price,
+          updatedAtMs: Date.parse(pr.updated_at),
+        });
       }
 
-      const aplicados: Array<Record<string, unknown>> = [];
-      const aRevisar: Array<Record<string, unknown>> = [];
+      const staged: StagedLine[] = [];
       const nuevos: string[] = [];
       const queued: Array<{
         entry: QuoteEntry;
@@ -483,43 +518,306 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
           });
           continue;
         }
-        const modelo = nameById.get(r.modelId) ?? entry.rawName;
+        const refs = refsByModel.get(r.modelId) ?? [];
+        const analysis = analyzeOffer(entry.price, sp.supplier.id, refs);
         const flags = checkQuoteEntry(entry, {
-          pairPrice: pairPrice.get(`${r.modelId}:${sp.supplier.id}`) ?? null,
-          modelMin: minByModel.get(r.modelId) ?? null,
+          pairPrice: refs.find((x) => x.supplierId === sp.supplier.id)?.price ?? null,
+          modelMin: refs.length ? Math.min(...refs.map((x) => x.price)) : null,
         });
-        if (flags.length > 0) {
-          aRevisar.push({
-            modelo,
-            precio: entry.price,
-            motivos: flags.map((f) => f.motivo),
-            ...(flags.find((f) => f.sugerencia !== undefined)
-              ? { sugerencia: flags.find((f) => f.sugerencia !== undefined)?.sugerencia }
-              : {}),
-          });
-          continue;
-        }
-        await deps.applyQuoteEntry(r.modelId, sp.supplier.id, entry);
-        aplicados.push({
-          modelo,
-          precio: entry.price,
-          ...(entry.tiers.length > 1 ? { escalones: entry.tiers.length } : {}),
+        const model = modelById.get(r.modelId);
+        staged.push({
+          aliasKey: entry.aliasKey,
+          rawName: entry.rawName,
+          modelId: r.modelId,
+          modelName: model?.canonical_name ?? entry.rawName,
+          categoryName: model?.category_id ? (catNameById.get(model.category_id) ?? null) : null,
+          price: entry.price,
+          tiers: entry.tiers,
+          analysis,
+          flags,
         });
       }
       if (queued.length > 0) deps.queueCandidates(queued);
+      if (staged.length > 0) {
+        deps.setStaged({
+          supplierId: sp.supplier.id,
+          supplierName: sp.supplier.name,
+          ts: Date.now(),
+          lines: staged,
+        });
+      }
+      const resumen = negotiationSummary(staged);
       return {
         proveedor: sp.supplier.name,
-        aplicados,
-        a_revisar: aRevisar,
+        resumen,
+        lineas: staged.map((l) => ({
+          modelo: l.modelName,
+          precio: l.price,
+          clasificacion: l.analysis.clasificacion,
+          vs_min_pct: l.analysis.vs_min_pct,
+          min: l.analysis.min
+            ? {
+                precio: l.analysis.min.price,
+                proveedor: supplierNameById.get(l.analysis.min.supplierId) ?? l.analysis.min.supplierId,
+                frescura: l.analysis.min.fresh,
+              }
+            : null,
+          mediana: l.analysis.mediana,
+          prev_propio: l.analysis.prev_propio,
+          ...(l.tiers.length > 1 ? { escalones: l.tiers.length } : {}),
+          ...(l.flags.length ? { flags: l.flags.map((f) => f.motivo) } : {}),
+        })),
         nuevos_en_cola: nuevos,
         nota:
-          `Auto-apliqué solo deltas ≤ ±${PRICE_AUTO_THRESHOLD}% y sin flags de sanidad. ` +
-          (aRevisar.length
-            ? "Los de a_revisar NO se aplicaron: confirmá el precio y usá set_price/set_tiers. "
-            : "") +
-          (nuevos.length
-            ? "Los nuevos quedaron en la COLA DE CONFIRMACIÓN de la Mesa (decile al usuario que los confirme ahí; nada se crea solo)."
-            : ""),
+          "NADA se aplicó: la lista quedó en la MESA DE NEGOCIACIÓN (visible en la Mesa). " +
+          "Aplicá selectivo con apply_lines (por clasificación/categoría/modelos), pedí mejora " +
+          "con counter_offer (solo las caras) o descartá con discard_lines." +
+          (nuevos.length ? " Los NUEVOS van a la cola de confirmación de la Mesa (nada se crea solo)." : ""),
+      };
+    }
+    case "apply_lines": {
+      const staged = deps.getStaged();
+      if (!staged) {
+        return { error: "No hay ninguna lista en negociación. Primero analyze_quote." };
+      }
+      const clsRaw = str(args, "classification");
+      const classification =
+        clsRaw === "oportunidad" || clsRaw === "en_linea" || clsRaw === "caro" || clsRaw === "sin_referencia"
+          ? (clsRaw as OfferClass)
+          : undefined;
+      const sel: LineSelector = {
+        models: strArr(args, "models"),
+        ...(str(args, "category") !== "" ? { category: str(args, "category") } : {}),
+        ...(classification !== undefined ? { classification } : {}),
+        all: args["all"] === true,
+        except: strArr(args, "except"),
+      };
+      if ((sel.models?.length ?? 0) === 0 && sel.category === undefined && sel.classification === undefined && sel.all !== true) {
+        return {
+          error:
+            "Decime QUÉ aplicar: models[…], category, classification ('oportunidad'|'en_linea'|'caro') o all:true (+except).",
+        };
+      }
+      const { selected, rest } = selectLines(staged.lines, sel);
+      if (selected.length === 0) {
+        return {
+          error: "Ningún renglón de la negociación matchea ese selector.",
+          en_mesa: staged.lines.map((l) => `${l.modelName} (${l.analysis.clasificacion})`),
+        };
+      }
+      const advertencias: string[] = [];
+      for (const l of selected) {
+        await deps.applyQuoteEntry(l.modelId, staged.supplierId, {
+          rawName: l.rawName,
+          aliasKey: l.aliasKey,
+          price: l.price,
+          tiers: l.tiers,
+          lines: [l.rawName],
+        });
+        for (const f of l.flags) advertencias.push(`${l.modelName}: ${f.motivo}`);
+      }
+      deps.removeStagedLines(selected.map((l) => l.aliasKey));
+      return {
+        proveedor: staged.supplierName,
+        aplicadas: selected.map((l) => ({
+          modelo: l.modelName,
+          precio: l.price,
+          clasificacion: l.analysis.clasificacion,
+          ...(l.tiers.length > 1 ? { escalones: l.tiers.length } : {}),
+        })),
+        ...(advertencias.length ? { advertencias } : {}),
+        quedan_en_mesa: rest.length,
+      };
+    }
+    case "discard_lines": {
+      const staged = deps.getStaged();
+      if (!staged) return { error: "No hay ninguna lista en negociación." };
+      if (args["all"] === true && strArr(args, "except").length === 0 && strArr(args, "models").length === 0) {
+        deps.clearStaged();
+        return { ok: true, descartadas: staged.lines.length, quedan_en_mesa: 0 };
+      }
+      const clsRaw = str(args, "classification");
+      const classification =
+        clsRaw === "oportunidad" || clsRaw === "en_linea" || clsRaw === "caro" || clsRaw === "sin_referencia"
+          ? (clsRaw as OfferClass)
+          : undefined;
+      const sel: LineSelector = {
+        models: strArr(args, "models"),
+        ...(str(args, "category") !== "" ? { category: str(args, "category") } : {}),
+        ...(classification !== undefined ? { classification } : {}),
+        all: args["all"] === true,
+        except: strArr(args, "except"),
+      };
+      const { selected, rest } = selectLines(staged.lines, sel);
+      if (selected.length === 0) return { error: "Ningún renglón matchea ese selector." };
+      deps.removeStagedLines(selected.map((l) => l.aliasKey));
+      return {
+        ok: true,
+        descartadas: selected.map((l) => l.modelName),
+        quedan_en_mesa: rest.length,
+      };
+    }
+    case "counter_offer": {
+      const staged = deps.getStaged();
+      if (!staged) {
+        return { error: "No hay ninguna lista en negociación. Primero analyze_quote." };
+      }
+      const mode = str(args, "mode") === "undercut" ? "undercut" : "match";
+      const suppliers = await deps.listSuppliers();
+      const nameOf = (id: string) => suppliers.find((x) => x.id === id)?.name ?? id;
+      const res = counterOffer(staged, nameOf, mode);
+      if (res.lineas.length === 0) {
+        return {
+          proveedor: staged.supplierName,
+          nota: "No hay líneas 🔴 caras en la negociación — nada que pedirle (las 🟢 no se mencionan para no despertar al proveedor).",
+        };
+      }
+      return {
+        proveedor: staged.supplierName,
+        objetivo: mode === "undercut" ? "nuestro mín − 1" : "matchear nuestro mín",
+        lineas: res.lineas,
+        texto_whatsapp: res.texto_whatsapp,
+        nota: "Números determinísticos de la Mesa. Si el usuario pide otro TONO, redactalo vos manteniendo LOS MISMOS números.",
+      };
+    }
+    case "price_position": {
+      const [models, categories, suppliers, prices, tiers] = await Promise.all([
+        deps.listModels(),
+        deps.listCategories(),
+        deps.listSuppliers(),
+        deps.listPrices(),
+        deps.listTiers(),
+      ]);
+      const supplierNameById = new Map(suppliers.map((x) => [x.id, x.name]));
+      const tierPairs = new Set(tiers.map((t) => `${t.model_id}:${t.supplier_id}`));
+      const now = Date.now();
+      const positionOf = (modelId: string, modelName: string) => {
+        const rows = prices.filter((pr) => pr.model_id === modelId);
+        if (rows.length === 0) return { modelo: modelName, proveedores: [], nota: "sin precios" };
+        const proveedores = rows
+          .map((pr) => ({
+            proveedor: supplierNameById.get(pr.supplier_id) ?? pr.supplier_id,
+            precio: pr.price,
+            frescura: classifyFreshness(Date.parse(pr.updated_at), now),
+            escala: tierPairs.has(`${modelId}:${pr.supplier_id}`),
+          }))
+          .sort((a, b) => a.precio - b.precio);
+        const minP = proveedores[0]!;
+        const maxP = proveedores[proveedores.length - 1]!;
+        const agg = rowAggregates(
+          Object.fromEntries(rows.map((pr) => [pr.supplier_id, pr.price])),
+          0,
+        );
+        return {
+          modelo: modelName,
+          proveedores,
+          min: { proveedor: minP.proveedor, precio: minP.precio, frescura: minP.frescura },
+          mediana: agg.med,
+          spread: {
+            abs: +(maxP.precio - minP.precio).toFixed(2),
+            pct: minP.precio > 0 ? +(((maxP.precio - minP.precio) / minP.precio) * 100).toFixed(1) : null,
+          },
+        };
+      };
+      const modelArg = str(args, "model");
+      if (modelArg) {
+        const ref = await resolveModelRef(deps, modelArg);
+        if (!ref.ok) return ref.error;
+        return positionOf(ref.modelId, ref.canonical);
+      }
+      const catArg = str(args, "category");
+      if (!catArg) return { error: "Pasá 'model' o 'category'." };
+      const cat = findByName(categories, catArg);
+      if (!cat) {
+        return { error: `No existe la categoría "${catArg}".`, categorias: categories.map((c) => c.name) };
+      }
+      const rows = models
+        .filter((m) => m.category_id === cat.id)
+        .map((m) => positionOf(m.id, m.canonical_name))
+        .filter((r) => r.proveedores.length > 0)
+        .slice(0, 60);
+      return { categoria: cat.name, modelos: rows };
+    }
+    case "discount_plan": {
+      const itemsRaw = args["items"];
+      if (!Array.isArray(itemsRaw) || itemsRaw.length === 0) {
+        return { error: "Pasá items: [{model, qty}] del pedido del cliente." };
+      }
+      const [prices, tiers, sales] = await Promise.all([
+        deps.listPrices(),
+        deps.listTiers(),
+        deps.listSalePrices(),
+      ]);
+      const { priceMatrix, tierMatrix } = buildMatrices(prices, tiers);
+      const saleByModel = new Map(sales.map((x) => [x.model_id, x.price]));
+      const marginPct = num(args, "margin_pct") ?? 3;
+      const inputs: DiscountInput[] = [];
+      const sinCosto: string[] = [];
+      for (const it of itemsRaw) {
+        if (typeof it !== "object" || it === null) continue;
+        const rec = it as Record<string, unknown>;
+        const modelRaw = typeof rec["model"] === "string" ? rec["model"] : "";
+        const qty = typeof rec["qty"] === "number" && rec["qty"] >= 1 ? Math.round(rec["qty"]) : 1;
+        const ref = await resolveModelRef(deps, modelRaw);
+        if (!ref.ok) return ref.error;
+        const suppliers = Object.keys(priceMatrix[ref.modelId] ?? {});
+        if (suppliers.length === 0) {
+          sinCosto.push(ref.canonical);
+          continue;
+        }
+        // costo REAL a esa cantidad: mejor proveedor respetando escalas (costForQty)
+        const best = suppliers
+          .map((spId) => ({ spId, c: costForQty(priceMatrix, tierMatrix, ref.modelId, spId, qty) }))
+          .sort((a, b) => a.c - b.c)[0]!;
+        const min = Math.min(...Object.values(priceMatrix[ref.modelId] ?? {}));
+        const lista = listaPrice(saleByModel.get(ref.modelId) ?? null, min, min, marginPct);
+        if (lista === null) {
+          sinCosto.push(ref.canonical);
+          continue;
+        }
+        inputs.push({ modelId: ref.modelId, modelName: ref.canonical, qty, cost: best.c, lista });
+      }
+      if (inputs.length === 0) {
+        return { error: "Ningún modelo del pedido tiene costo/Lista en la Mesa.", sin_datos: sinCosto };
+      }
+      const floorRaw = num(args, "floor_pct");
+      const targetRaw = num(args, "target_pct");
+      const plan = discountPlan(inputs, {
+        ...(targetRaw !== null ? { targetPct: targetRaw } : {}),
+        ...(floorRaw !== null ? { floorPct: floorRaw } : {}),
+      });
+      return {
+        lineas: plan.lineas.map((l) => ({
+          modelo: l.modelName,
+          qty: l.qty,
+          costo: l.cost,
+          lista: l.lista,
+          margen_pct: l.margen_pct,
+          sugerencia: l.sugerencia,
+          precio_final: l.precio_final,
+          margen_final_pct: l.margen_final_pct,
+        })),
+        totales: plan.totales,
+        ...(sinCosto.length ? { sin_datos: sinCosto } : {}),
+        nota: "Conceder donde el margen es gordo, sostener donde es fino; el piso de margen no se perfora (floor_pct, default 1%).",
+      };
+    }
+    case "remember": {
+      const note = str(args, "note");
+      if (!note) return { error: "Falta 'note' (la regla/aprendizaje a guardar)." };
+      const about = str(args, "about");
+      const encoded = encodeNote(note, about === "" ? undefined : about);
+      await deps.insertKnowledge(encoded);
+      return { ok: true, guardada: encoded };
+    }
+    case "recall": {
+      const rules = (await deps.listKnowledge()).map((k) => k.rule_text);
+      const about = str(args, "about");
+      const notas = recallNotes(rules, about === "" ? undefined : about);
+      return {
+        ...(about !== "" ? { about } : {}),
+        notas,
+        total_memoria: rules.length,
       };
     }
     case "whatsapp_list": {

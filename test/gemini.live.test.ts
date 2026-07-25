@@ -176,6 +176,91 @@ function r2content(r: LiveResponse): GeminiContent {
   return { role: "model", parts: partsOf(r) };
 }
 
+describe.skipIf(!LIVE)("Negociador REAL — analyze → apply parcial → counter_offer (dry-run)", () => {
+  it(
+    "una negociación simulada end-to-end elige las tools y selectores correctos",
+    async () => {
+      const system = buildAgentSystem(AGENT_CTX);
+      const contents: GeminiContent[] = [];
+      const allCalls: GeminiFunctionCall[] = [];
+
+      // corre turnos hasta que el modelo deja de llamar tools; responde SINTÉTICO (dry-run)
+      const runTurns = async (respond: (c: GeminiFunctionCall) => Record<string, unknown>) => {
+        for (let i = 0; i < 4; i++) {
+          const res = await callLive({ system, contents, tools: AGENT_TOOLS, maxTokens: 2048 });
+          contents.push(r2content(res));
+          const calls = callsOf(res);
+          if (calls.length === 0) break;
+          allCalls.push(...calls);
+          contents.push({
+            role: "user",
+            parts: calls.map((c) => ({
+              functionResponse: { name: c.name, response: respond(c) },
+            })),
+          });
+        }
+      };
+
+      // 1) el usuario pega la lista → analyze_quote (staging, sin aplicar)
+      contents.push({
+        role: "user",
+        parts: [
+          {
+            text:
+              "te paso la lista de Planet:\nS26 12+512 5G DS 585\nS26 ULTRA 12/512GB 5G 940\nA17 4+128 DS 118",
+          },
+        ],
+      });
+      const analysis = {
+        proveedor: "Planet",
+        resumen: { oportunidades: 1, en_linea: 1, caras: 1, sin_referencia: 0, frase: "1 oportunidad — aplicala; 1 cara — pedí mejora" },
+        lineas: [
+          { modelo: "S26 12+512 5G DS", precio: 585, clasificacion: "oportunidad", vs_min_pct: -2.5, min: { precio: 600, proveedor: "Bax" } },
+          { modelo: "S26 ULTRA 12/512GB 5G", precio: 940, clasificacion: "en_linea", vs_min_pct: 0.5, min: { precio: 935, proveedor: "Bax" } },
+          { modelo: "A17 4+128 DS", precio: 118, clasificacion: "caro", vs_min_pct: 7.3, min: { precio: 110, proveedor: "Vitel" } },
+        ],
+        nuevos_en_cola: [],
+        nota: "NADA se aplicó: quedó en la mesa de negociación.",
+      };
+      await runTurns((c) => (c.name === "analyze_quote" ? analysis : { ok: true, dry_run: true }));
+      expect(allCalls.some((c) => c.name === "analyze_quote")).toBe(true);
+      const aq = allCalls.find((c) => c.name === "analyze_quote")!;
+      expect(String(aq.args?.["supplier"] ?? "")).toMatch(/planet/i);
+      expect(String(aq.args?.["text"] ?? "")).toContain("585"); // texto completo, no resumido
+
+      // 2) aplicar SOLO las oportunidades
+      const before = allCalls.length;
+      contents.push({ role: "user", parts: [{ text: "dale, aplicá solo las oportunidades" }] });
+      await runTurns((c) =>
+        c.name === "apply_lines"
+          ? { proveedor: "Planet", aplicadas: [{ modelo: "S26 12+512 5G DS", precio: 585 }], quedan_en_mesa: 2 }
+          : { ok: true, dry_run: true },
+      );
+      const applied = allCalls.slice(before).find((c) => c.name === "apply_lines");
+      expect(applied).toBeDefined();
+      expect(applied?.args?.["classification"]).toBe("oportunidad");
+
+      // 3) contraoferta para las caras
+      const before2 = allCalls.length;
+      contents.push({
+        role: "user",
+        parts: [{ text: "armame la contraoferta para Planet por lo que quedó caro" }],
+      });
+      await runTurns((c) =>
+        c.name === "counter_offer"
+          ? {
+              proveedor: "Planet",
+              lineas: [{ modelo: "A17 4+128 DS", ofrecido: 118, nuestro_min: 110, min_de: "Vitel", objetivo: 110 }],
+              texto_whatsapp: "Hola Planet, revisé tu lista. A17 4+128 DS\tme pasaste $118 · lo tengo a $110 → te cierro a $110",
+            }
+          : { ok: true, dry_run: true },
+      );
+      expect(allCalls.slice(before2).some((c) => c.name === "counter_offer")).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+});
+
 describe.skipIf(!LIVE || !HAS_DB)("Fase 8 — flujo EJECUTADO real: create_category + move", () => {
   it(
     "crea 'Samsung Gama Alta' y mueve el S26 (queda como demo coherente)",

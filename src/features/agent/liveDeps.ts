@@ -5,7 +5,7 @@ import { listClients } from "../../data/clients";
 import { insertCategory, listCategories, listDepartments, renameCategory } from "../../data/departments";
 import { listInvoiceItems, listInvoices } from "../../data/invoices";
 import { listLedger } from "../../data/ledger";
-import { listOps } from "../../data/misc";
+import { insertKnowledge, listKnowledge, listOps } from "../../data/misc";
 import { updateModel, listModels } from "../../data/models";
 import {
   appendPriceHistory,
@@ -27,6 +27,12 @@ import { insertSupplier, listSuppliers, updateSupplier } from "../../data/suppli
 import { supabase, type Db } from "../../data/supabase";
 import { applyEntry } from "../mesa/applyQuote";
 import { enqueueCandidates } from "../mesa/queueStore";
+import {
+  clearStagedNegotiation,
+  getStagedNegotiation,
+  removeStagedLines as removeStagedNegotiationLines,
+  setStagedNegotiation,
+} from "./negotiationStore";
 import { buildDeskInvoices, buildLedgerEntries } from "../shared/invoiceInputs";
 import type { ToolDeps } from "./executor";
 import { extractQuoteAI } from "./extraction";
@@ -89,5 +95,13 @@ export function buildLiveDeps(db: Db = supabase): ToolDeps {
     extractQuote: (input) => extractQuoteAI(input),
     applyQuoteEntry: (modelId, supplierId, entry) => applyEntry(modelId, supplierId, entry, db),
     queueCandidates: (items) => enqueueCandidates(items),
+    getStaged: () => getStagedNegotiation(),
+    setStaged: (neg) => setStagedNegotiation(neg),
+    removeStagedLines: (aliasKeys) => removeStagedNegotiationLines(aliasKeys),
+    clearStaged: () => clearStagedNegotiation(),
+    listKnowledge: () => listKnowledge(db),
+    insertKnowledge: async (ruleText) => {
+      await insertKnowledge(ruleText, db);
+    },
   };
 }

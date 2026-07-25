@@ -151,9 +151,9 @@ const DECLARATIONS: Declaration[] = [
     },
   },
   {
-    name: "load_quote",
+    name: "analyze_quote",
     description:
-      "Carga a la Mesa una LISTA DE PRECIOS que el usuario pegó en el chat (texto crudo del proveedor). Extrae con IA, resuelve identidad con el resolvedor y: aplica solo los precios sanos (delta ≤ ±15% y sin flags), lista los sospechosos en a_revisar (NO se aplican) y manda los modelos nuevos a la cola de confirmación de la Mesa (nada se crea solo). Usala SIEMPRE que el usuario pegue una cotización con varios modelos+precios. Pasá el texto COMPLETO tal cual.",
+      "MESA DE NEGOCIACIÓN: el usuario pega una lista de precios de un proveedor → extrae con IA, resuelve identidad y STAGEA la lista con el análisis por línea contra la Mesa actual (🟢 oportunidad = mejor que nuestro mín · 🟡 en línea ±1.5% · 🔴 cara: cuánto y quién la tiene mejor · vs mediana y vs el precio anterior del MISMO proveedor, con frescura). NO aplica nada. Los modelos nuevos van a la cola de confirmación. Usala SIEMPRE que peguen una lista con varios modelos+precios; pasá el texto COMPLETO tal cual.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -162,6 +162,96 @@ const DECLARATIONS: Declaration[] = [
       },
       required: ["supplier", "text"],
     },
+  },
+  {
+    name: "apply_lines",
+    description:
+      "Aplica SELECTIVAMENTE líneas de la negociación en curso a la Mesa (precio+escala por fila). Selector: models[] (nombres), category, classification ('oportunidad'|'en_linea'|'caro') o all:true — combinable con except[] ('todo menos X'). Lo aplicado sale de la mesa de negociación; el resto queda. Solo por instrucción explícita del usuario.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        models: { type: "ARRAY", items: { type: "STRING" }, description: "Nombres/fragmentos de modelo." },
+        category: STR("Categoría de la Mesa (ej. 'Samsung Gama Alta')."),
+        classification: STR("'oportunidad' | 'en_linea' | 'caro'."),
+        all: { type: "BOOLEAN", description: "true = todas las líneas stageadas." },
+        except: { type: "ARRAY", items: { type: "STRING" }, description: "Excluir estos modelos." },
+      },
+    },
+  },
+  {
+    name: "discard_lines",
+    description:
+      "Descarta líneas de la negociación en curso SIN aplicarlas (mismo selector que apply_lines; all:true descarta todo).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        models: { type: "ARRAY", items: { type: "STRING" } },
+        category: STR("Categoría."),
+        classification: STR("'oportunidad' | 'en_linea' | 'caro'."),
+        all: { type: "BOOLEAN" },
+        except: { type: "ARRAY", items: { type: "STRING" } },
+      },
+    },
+  },
+  {
+    name: "counter_offer",
+    description:
+      "Arma la CONTRAOFERTA para el proveedor de la lista en negociación: para las líneas 🔴 caras propone el precio objetivo (matchear nuestro mín, o mín−1 con mode 'undercut') y devuelve el texto listo para WhatsApp. Las 🟢 no se mencionan (no despertar al proveedor). Números determinísticos de la Mesa.",
+    parameters: {
+      type: "OBJECT",
+      properties: { mode: STR("'match' (default: igualar nuestro mín) o 'undercut' (mín − 1).") },
+    },
+  },
+  {
+    name: "price_position",
+    description:
+      "Dónde estamos parados (brief del negociador): por modelo — todos los proveedores con precio/frescura/escala, quién tiene el mín, mediana y spread. Por categoría — el resumen de cada modelo. Usala antes de negociar.",
+    parameters: {
+      type: "OBJECT",
+      properties: { model: STR("Modelo puntual (opcional)."), category: STR("Categoría (opcional).") },
+    },
+  },
+  {
+    name: "discount_plan",
+    description:
+      "Lado CLIENTE: si un cliente pide mejor precio en un pedido, propone DÓNDE conceder (modelos con margen gordo entre costo real y Lista) y dónde sostener, con el impacto total. Usa el costo REAL a esa cantidad (escalas). target_pct = descuento total que pide el cliente; floor_pct = piso de margen (default 1%).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        items: {
+          type: "ARRAY",
+          description: "El pedido: [{model, qty}].",
+          items: {
+            type: "OBJECT",
+            properties: { model: STR("Modelo."), qty: { type: "INTEGER" } },
+            required: ["model"],
+          },
+        },
+        target_pct: NUM("Descuento total % que pide el cliente (opcional)."),
+        floor_pct: NUM("Piso de margen % por línea (default 1)."),
+        margin_pct: NUM("Margen % para la Lista automática (default 3)."),
+      },
+      required: ["items"],
+    },
+  },
+  {
+    name: "remember",
+    description:
+      "Guarda un APRENDIZAJE de negociación en la memoria de la casa (ej. 'afloja 2% con volumen', 'paga a 30 días, no conceder más de 1%'). Usala cuando el usuario te enseña algo o al cerrar una negociación con una lección clara. 'about' = proveedor/cliente/modelo al que refiere.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        note: STR("La nota, corta y accionable."),
+        about: STR("Proveedor/cliente/modelo al que refiere (opcional)."),
+      },
+      required: ["note"],
+    },
+  },
+  {
+    name: "recall",
+    description:
+      "Trae las notas de la memoria sobre una parte ('about' = proveedor/cliente/modelo) o todas. Usala antes de negociar con alguien si no tenés sus notas a mano.",
+    parameters: { type: "OBJECT", properties: { about: STR("Filtro (opcional).") } },
   },
   {
     name: "whatsapp_list",
@@ -250,7 +340,8 @@ export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   "set_tiers",
   "set_sale_price",
   "delete_price",
-  "load_quote",
+  "apply_lines",
+  "remember",
 ]);
 
 export type AgentSystemContext = {
@@ -266,7 +357,15 @@ export type AgentSystemContext = {
 /** System prompt del agente — dinámico (catálogos reales) y propose-only. */
 export function buildAgentSystem(ctx: AgentSystemContext): string {
   return [
-    "Sos el TRADER-ASISTENTE del Price Desk de un mayorista de celulares. Operás la base de datos de la Mesa (modelos, categorías, proveedores, precios, escalas, Lista) y respondés consultas del negocio (cuentas, clientes, PnL, mejores proveedores) usando SOLO tus tools.",
+    "Sos el VENDEDOR/NEGOCIADOR del Price Desk de un mayorista de celulares — no un cargador de datos. Comprás bien (proveedores) y vendés bien (clientes), con memoria de la casa. Operás la Mesa (modelos, categorías, proveedores, precios, escalas, Lista) y respondés consultas del negocio usando SOLO tus tools.",
+    "",
+    "NEGOCIACIÓN (tu flujo central): una lista pegada = MESA DE NEGOCIACIÓN, no aplicar-todo.",
+    "  1) analyze_quote la stagea y te da el análisis por línea: 🟢 oportunidad (mejor que nuestro mín — decile al usuario que consiguió buen precio y cuánto mejora), 🟡 en línea, 🔴 cara (cuánto arriba y quién la tiene mejor).",
+    "  2) Contale el resumen como negociador ('5 oportunidades — aplicalas; 8 caras — pedile mejora') y esperá la decisión.",
+    "  3) apply_lines aplica SOLO lo que el usuario diga (por clasificación, categoría, modelos o todo-menos). discard_lines tira el resto.",
+    "  4) counter_offer arma el pedido de mejora al proveedor (solo las 🔴; las 🟢 ni mencionarlas). Si piden otro tono, redactalo vos con LOS MISMOS números.",
+    "  5) Lado cliente: discount_plan decide dónde conceder (margen gordo) y dónde sostener. price_position es tu brief antes de cualquier negociación.",
+    "  6) MEMORIA: remember guarda lo aprendido ('planET afloja 2% con volumen') — usala cuando el usuario te enseña algo o se cierra una negociación; recall la trae. Tus notas ya vienen en este prompt: usalas al negociar sin que te las repitan.",
     "",
     "IDENTIDAD (regla de oro): los modelos se referencian por NOMBRE y el sistema los resuelve con un resolvedor determinístico. Si una tool contesta que el modelo no existe, NO insistas con variantes inventadas: decile al usuario qué no encontraste (con los parecidos que te dio la tool) y preguntá. create_model NUNCA duplica: si el nombre ya resuelve, te devuelve el existente.",
     "",

@@ -11,11 +11,13 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import type { Json } from "../../data/database.types";
+import { useClients } from "../../data/clients";
 import { useCategories, useDepartments } from "../../data/departments";
 import { keys } from "../../data/keys";
 import { useAppendChatLog, useKnowledge } from "../../data/misc";
 import { useModels } from "../../data/models";
 import { useSuppliers } from "../../data/suppliers";
+import { orderNotesByMention } from "../../domain/negotiation";
 import s from "../mesa/styles";
 import { executeTool, type ToolCall, type ToolResult } from "./executor";
 import { functionCallsOf, generateTurn, textOf, type GeminiContent } from "./gemini";
@@ -59,6 +61,7 @@ export function AgentPanel(props: { activeTabLabel: string }) {
   const categories = useCategories();
   const suppliers = useSuppliers();
   const models = useModels();
+  const clients = useClients();
   const knowledge = useKnowledge();
   const appendLog = useAppendChatLog();
   const qc = useQueryClient();
@@ -86,12 +89,22 @@ export function AgentPanel(props: { activeTabLabel: string }) {
     setBusy(true);
     push({ kind: "user", text });
 
+    // memoria del negociador: SIEMPRE va toda; si el mensaje menciona un proveedor o
+    // cliente, sus notas van PRIMERO (el agente negocia con el contexto de la casa)
+    const partyNames = [
+      ...(suppliers.data ?? []).map((sp) => sp.name),
+      ...(clients.data ?? []).map((c) => c.name),
+    ];
+    const mentioned = partyNames.filter((n) => text.toLowerCase().includes(n.toLowerCase()));
     const system = buildAgentSystem({
       departments: (departments.data ?? []).map((d) => d.name),
       categories: (categories.data ?? []).map((c) => c.name),
       suppliers: (suppliers.data ?? []).filter((sp) => sp.active).map((sp) => sp.name),
       modelCount: (models.data ?? []).length,
-      knowledge: (knowledge.data ?? []).map((k) => k.rule_text),
+      knowledge: orderNotesByMention(
+        (knowledge.data ?? []).map((k) => k.rule_text),
+        mentioned,
+      ),
       activeTab: props.activeTabLabel,
     });
     const deps = buildLiveDeps();
@@ -169,6 +182,7 @@ export function AgentPanel(props: { activeTabLabel: string }) {
           qc.invalidateQueries({ queryKey: keys.priceTiers() }),
           qc.invalidateQueries({ queryKey: keys.salePrices }),
           qc.invalidateQueries({ queryKey: keys.priceHistory() }),
+          qc.invalidateQueries({ queryKey: keys.knowledge }),
         ]);
       }
       appendLog.mutate({

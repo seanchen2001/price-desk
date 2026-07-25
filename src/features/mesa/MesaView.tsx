@@ -20,6 +20,7 @@ import {
 import { listaPrice, whatsappQuoteText, type WhatsappGroup } from "../../domain/whatsapp";
 import { ConfirmQueue } from "./ConfirmQueue";
 import { MesaTable } from "./MesaTable";
+import { NegotiationPanel } from "./NegotiationPanel";
 import { PastePanel } from "./PastePanel";
 import { useConfirmQueue } from "./queueStore";
 import s from "./styles";
@@ -249,6 +250,7 @@ export function MesaView() {
         <span style={s.toolNote}>los precios expiran cada lunes</span>
       </div>
 
+      <NegotiationPanel />
       <PastePanel onQueue={enqueue} />
       <ConfirmQueue
         items={queueItems}

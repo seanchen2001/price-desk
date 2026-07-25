@@ -7,6 +7,17 @@
 import { describe, expect, it, vi } from "vitest";
 import { normalize } from "../src/domain/normalize";
 import { clientPulse } from "../src/domain/pulse";
+import {
+  analyzeOffer,
+  counterOffer,
+  discountPlan,
+  encodeNote,
+  noteAbout,
+  orderNotesByMention,
+  recallNotes,
+  selectLines,
+  type StagedNegotiation,
+} from "../src/domain/negotiation";
 import { listaPrice, whatsappQuoteText } from "../src/domain/whatsapp";
 import {
   buildExtractionSystem,
@@ -205,13 +216,43 @@ function mockDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
     extractQuote: vi.fn(async () => []),
     applyQuoteEntry: vi.fn(async () => {}),
     queueCandidates: vi.fn(() => {}),
+    ...stagingMock(),
+    listKnowledge: async () => knowledgeRows.map((r) => ({ ...r })),
+    insertKnowledge: vi.fn(async (t: string) => {
+      knowledgeRows.push({ id: String(knowledgeRows.length + 1), rule_text: t });
+    }),
   };
   return { ...base, ...overrides };
 }
 
+// staging en memoria (mismo contrato que el store zustand real)
+function stagingMock() {
+  const box: { current: StagedNegotiation | null } = { current: null };
+  return {
+    getStaged: () => box.current,
+    setStaged: vi.fn((neg: StagedNegotiation) => {
+      box.current = neg;
+    }),
+    removeStagedLines: vi.fn((aliasKeys: readonly string[]) => {
+      if (!box.current) return;
+      const drop = new Set(aliasKeys);
+      const lines = box.current.lines.filter((l) => !drop.has(l.aliasKey));
+      box.current = lines.length ? { ...box.current, lines } : null;
+    }),
+    clearStaged: vi.fn(() => {
+      box.current = null;
+    }),
+  };
+}
+
+let knowledgeRows: Array<{ id: string; rule_text: string }> = [];
+
 describe("Fase 8 — declaraciones de tools", () => {
-  it("cada tool declarada tiene ejecutor (y viceversa)", () => {
-    expect(new Set(TOOL_NAMES)).toEqual(new Set(EXECUTABLE_TOOLS));
+  it("cada tool declarada tiene ejecutor; load_quote queda como alias legado", () => {
+    for (const t of TOOL_NAMES) expect(EXECUTABLE_TOOLS.has(t), t).toBe(true);
+    expect(TOOL_NAMES.has("analyze_quote")).toBe(true);
+    expect(TOOL_NAMES.has("load_quote")).toBe(false); // no se declara (alias en el executor)
+    expect(EXECUTABLE_TOOLS.has("load_quote")).toBe(true);
   });
 
   it("las destructivas piden confirmación y todas las de escritura invalidan cache", () => {
@@ -220,6 +261,9 @@ describe("Fase 8 — declaraciones de tools", () => {
     expect(CONFIRM_TOOLS.has("set_price")).toBe(false);
     for (const t of CONFIRM_TOOLS) expect(MUTATING_TOOLS.has(t)).toBe(true);
     for (const t of MUTATING_TOOLS) expect(TOOL_NAMES.has(t)).toBe(true);
+    expect(MUTATING_TOOLS.has("apply_lines")).toBe(true); // aplica precios
+    expect(MUTATING_TOOLS.has("remember")).toBe(true); // escribe knowledge
+    expect(MUTATING_TOOLS.has("analyze_quote")).toBe(false); // solo stagea
   });
 
   it("el system del agente lleva el contexto dinámico", () => {
@@ -422,76 +466,306 @@ describe("Fase 8 — ejecutor: tools → mutaciones por fila (deps mockeadas)", 
   });
 });
 
-// ---------- load_quote (lista pegada en el chat → misma tubería propose-only) ----------
+// ---------- mesa de negociación (analyze → apply parcial → counter_offer) ----------
 
-describe("Fase 8+ — load_quote desde el chat", () => {
+describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () => {
   const quoteItems = [
-    // sano: delta chico vs par (600→610) y vs mín → auto
-    { rawName: "S26 12+512 5G DS", supplier: "", price: 610, tiers: [] },
-    // sospechoso: 61 ≈ 1/10 del mín del modelo (600) → flag, NO se aplica
+    // 🟢 oportunidad: 585 vs mín 600 (−2.5%)
+    { rawName: "S26 12+512 5G DS", supplier: "", price: 585, tiers: [] },
+    // 🔴 cara + flag de unidad: 6100 vs mín 610 del modelo (~10×)
     { rawName: "A17 4+128 DS", supplier: "", price: 6100, tiers: [] },
-    // nuevo: no resuelve → cola de confirmación
+    // nuevo → cola de confirmación (no se stagea)
     { rawName: "iPhone 18 Fold 1TB", supplier: "", price: 1500, tiers: [] },
   ];
+  const pricesRefs = async () => [
+    { model_id: "m1", supplier_id: "s-bax", price: 600, updated_at: new Date().toISOString() },
+    { model_id: "m1", supplier_id: "s-sou", price: 640, updated_at: new Date().toISOString() },
+    { model_id: "m2", supplier_id: "s-sou", price: 610, updated_at: new Date().toISOString() },
+  ];
 
-  it("aplica lo sano, flaggea lo sospechoso y encola lo nuevo (jamás crea)", async () => {
-    const deps = mockDeps({
-      extractQuote: vi.fn(async () => quoteItems),
-      listPrices: async () => [
-        { model_id: "m1", supplier_id: "s-bax", price: 600, updated_at: new Date().toISOString() },
-        { model_id: "m2", supplier_id: "s-sou", price: 610, updated_at: new Date().toISOString() },
-      ],
-    });
-    const r = await executeTool(
-      { name: "load_quote", args: { supplier: "bax", text: "S26 610\nA17 6100\niPhone 18 Fold 1500" } },
+  async function stageNegotiation(deps: ToolDeps) {
+    return executeTool(
+      { name: "analyze_quote", args: { supplier: "bax", text: "S26 585\nA17 6100\niPhone 18 Fold 1500" } },
       deps,
     );
+  }
+
+  it("clasifica 🟢/🔴 contra la Mesa, encola lo nuevo y NO aplica", async () => {
+    const deps = mockDeps({
+      extractQuote: vi.fn(async () => quoteItems),
+      listPrices: pricesRefs,
+    });
+    const r = await stageNegotiation(deps);
     expect(r["proveedor"]).toBe("Bax");
-    const aplicados = r["aplicados"] as Array<Record<string, unknown>>;
-    expect(aplicados).toHaveLength(1);
-    expect(aplicados[0]?.["modelo"]).toBe("S26 12+512 5G DS");
+    const resumen = r["resumen"] as Record<string, unknown>;
+    expect(resumen["oportunidades"]).toBe(1);
+    expect(resumen["caras"]).toBe(1);
+    const lineas = r["lineas"] as Array<Record<string, unknown>>;
+    const s26 = lineas.find((l) => l["modelo"] === "S26 12+512 5G DS")!;
+    expect(s26["clasificacion"]).toBe("oportunidad");
+    expect(s26["vs_min_pct"]).toBe(-2.5);
+    expect((s26["min"] as Record<string, unknown>)["proveedor"]).toBe("Bax");
+    const a17 = lineas.find((l) => l["modelo"] === "A17 4+128 DS")!;
+    expect(a17["clasificacion"]).toBe("caro");
+    expect(String((a17["flags"] as string[]).join(" "))).toMatch(/unidad/);
+    expect(r["nuevos_en_cola"]).toEqual(["iPhone 18 Fold 1TB"]);
+    // guardrails: nada aplicado, nada creado; quedó STAGEADO
+    expect(deps.applyQuoteEntry).not.toHaveBeenCalled();
+    expect(deps.createModelWithAlias).not.toHaveBeenCalled();
+    expect(deps.getStaged()?.lines).toHaveLength(2);
+    expect(deps.queueCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it("load_quote sigue funcionando como alias (mismo staging)", async () => {
+    const deps = mockDeps({
+      extractQuote: vi.fn(async () => [quoteItems[0]!]),
+      listPrices: pricesRefs,
+    });
+    const r = await executeTool({ name: "load_quote", args: { supplier: "Bax", text: "S26 585" } }, deps);
+    expect((r["resumen"] as Record<string, unknown>)["oportunidades"]).toBe(1);
+    expect(deps.getStaged()?.lines).toHaveLength(1);
+  });
+
+  it("apply_lines por clasificación aplica SOLO eso y lo saca de la mesa", async () => {
+    const deps = mockDeps({
+      extractQuote: vi.fn(async () => quoteItems),
+      listPrices: pricesRefs,
+    });
+    await stageNegotiation(deps);
+    const r = await executeTool(
+      { name: "apply_lines", args: { classification: "oportunidad" } },
+      deps,
+    );
+    const aplicadas = r["aplicadas"] as Array<Record<string, unknown>>;
+    expect(aplicadas).toHaveLength(1);
+    expect(aplicadas[0]?.["modelo"]).toBe("S26 12+512 5G DS");
     expect(deps.applyQuoteEntry).toHaveBeenCalledTimes(1);
     expect(deps.applyQuoteEntry).toHaveBeenCalledWith(
       "m1",
       "s-bax",
-      expect.objectContaining({ price: 610 }),
+      expect.objectContaining({ price: 585 }),
     );
-    const aRevisar = r["a_revisar"] as Array<Record<string, unknown>>;
-    expect(aRevisar).toHaveLength(1);
-    expect(aRevisar[0]?.["modelo"]).toBe("A17 4+128 DS");
-    expect(String((aRevisar[0]?.["motivos"] as string[]).join(" "))).toMatch(/unidad/);
-    expect(r["nuevos_en_cola"]).toEqual(["iPhone 18 Fold 1TB"]);
-    expect(deps.queueCandidates).toHaveBeenCalledTimes(1);
-    const queued = (deps.queueCandidates as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0] as Array<Record<string, unknown>>;
-    expect(queued[0]).toMatchObject({ supplierId: "s-bax", supplierName: "Bax" });
-    // guardrail: cero creaciones de catálogo desde la IA
-    expect(deps.createModelWithAlias).not.toHaveBeenCalled();
+    expect(r["quedan_en_mesa"]).toBe(1); // la cara sigue en negociación
+    expect(deps.getStaged()?.lines[0]?.modelName).toBe("A17 4+128 DS");
   });
 
-  it("proveedor con typo → NO carga, propone el existente (quisiste_decir)", async () => {
-    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) });
+  it("apply_lines all + except ('todo menos el A17')", async () => {
+    const deps = mockDeps({
+      extractQuote: vi.fn(async () => quoteItems),
+      listPrices: pricesRefs,
+    });
+    await stageNegotiation(deps);
     const r = await executeTool(
-      { name: "load_quote", args: { supplier: "Baxx", text: "S26 610" } },
+      { name: "apply_lines", args: { all: true, except: ["A17"] } },
       deps,
     );
-    expect(String(r["error"])).toMatch(/No existe el proveedor/);
-    expect(r["quisiste_decir"]).toBe("Bax");
-    expect(deps.extractQuote).not.toHaveBeenCalled();
+    expect((r["aplicadas"] as unknown[]).length).toBe(1);
+    expect(r["quedan_en_mesa"]).toBe(1);
+  });
+
+  it("apply_lines sin selector o sin staging → error claro", async () => {
+    const deps = mockDeps();
+    const sinStaging = await executeTool({ name: "apply_lines", args: { all: true } }, deps);
+    expect(String(sinStaging["error"])).toMatch(/analyze_quote/);
+    const deps2 = mockDeps({ extractQuote: vi.fn(async () => quoteItems), listPrices: pricesRefs });
+    await stageNegotiation(deps2);
+    const sinSelector = await executeTool({ name: "apply_lines", args: {} }, deps2);
+    expect(String(sinSelector["error"])).toMatch(/QUÉ aplicar/);
+    expect(deps2.applyQuoteEntry).not.toHaveBeenCalled();
+  });
+
+  it("discard_lines all limpia la mesa sin aplicar", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems), listPrices: pricesRefs });
+    await stageNegotiation(deps);
+    const r = await executeTool({ name: "discard_lines", args: { all: true } }, deps);
+    expect(r["descartadas"]).toBe(2);
+    expect(deps.getStaged()).toBeNull();
     expect(deps.applyQuoteEntry).not.toHaveBeenCalled();
   });
 
-  it("case/puntuación del proveedor matchea directo ('bax.' → Bax)", async () => {
-    const deps = mockDeps({
-      extractQuote: vi.fn(async () => [quoteItems[0]!]),
-      listPrices: async () => [],
-    });
+  it("counter_offer: solo las 🔴, objetivo = nuestro mín (o mín−1), texto con números de la Mesa", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems), listPrices: pricesRefs });
+    await stageNegotiation(deps);
+    const r = await executeTool({ name: "counter_offer", args: {} }, deps);
+    const lineas = r["lineas"] as Array<Record<string, unknown>>;
+    expect(lineas).toHaveLength(1);
+    expect(lineas[0]).toMatchObject({ modelo: "A17 4+128 DS", ofrecido: 6100, nuestro_min: 610, objetivo: 610 });
+    const texto = String(r["texto_whatsapp"]);
+    expect(texto).toContain("Bax");
+    expect(texto).toContain("A17 4+128 DS");
+    expect(texto).not.toContain("S26"); // la 🟢 no se menciona
+    const under = await executeTool({ name: "counter_offer", args: { mode: "undercut" } }, deps);
+    expect((under["lineas"] as Array<Record<string, unknown>>)[0]?.["objetivo"]).toBe(609);
+  });
+
+  it("proveedor con typo → NO analiza, propone el existente", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) });
+    const r = await executeTool({ name: "analyze_quote", args: { supplier: "Baxx", text: "S26 585" } }, deps);
+    expect(String(r["error"])).toMatch(/No existe el proveedor/);
+    expect(r["quisiste_decir"]).toBe("Bax");
+    expect(deps.extractQuote).not.toHaveBeenCalled();
+  });
+});
+
+describe("Negociador — price_position / discount_plan / memoria", () => {
+  it("price_position por modelo: proveedores ordenados, mín, spread", async () => {
+    const deps = mockDeps();
+    const r = await executeTool({ name: "price_position", args: { model: "S26 12+512 5G DS" } }, deps);
+    const proveedores = r["proveedores"] as Array<Record<string, unknown>>;
+    expect(proveedores.map((p) => p["proveedor"])).toEqual(["Bax", "South"]);
+    expect((r["min"] as Record<string, unknown>)["proveedor"]).toBe("Bax");
+    expect((r["spread"] as Record<string, unknown>)["abs"]).toBe(40);
+    expect(proveedores[0]?.["escala"]).toBe(true); // Bax tiene escalera en el mock
+  });
+
+  it("discount_plan: concede en margen gordo, respeta el piso y usa costForQty (escala)", async () => {
+    const deps = mockDeps();
     const r = await executeTool(
-      { name: "load_quote", args: { supplier: "BAX.", text: "S26 610" } },
+      { name: "discount_plan", args: { items: [{ model: "S26 12+512 5G DS", qty: 50 }] } },
       deps,
     );
-    expect(r["proveedor"]).toBe("Bax");
-    expect(deps.applyQuoteEntry).toHaveBeenCalledTimes(1);
+    const linea = (r["lineas"] as Array<Record<string, unknown>>)[0]!;
+    expect(linea["costo"]).toBe(580); // tier de 50 de Bax, no el precio base 600
+    expect(linea["lista"]).toBe(618); // mín 600 + 3%
+    expect(linea["sugerencia"]).toBe("conceder"); // margen 6.1% > piso
+    expect(Number(linea["precio_final"])).toBeLessThan(618);
+    expect(Number(linea["margen_final_pct"])).toBeGreaterThanOrEqual(1);
+  });
+
+  it("discount_plan con target_pct: alcanza el descuento sin perforar el piso", async () => {
+    const deps = mockDeps();
+    const r = await executeTool(
+      {
+        name: "discount_plan",
+        args: { items: [{ model: "S26 12+512 5G DS", qty: 50 }], target_pct: 2, floor_pct: 1 },
+      },
+      deps,
+    );
+    const tot = r["totales"] as Record<string, number>;
+    expect(tot.descuento_pct).toBeGreaterThan(1.5);
+    expect(tot.descuento_pct).toBeLessThanOrEqual(2.1);
+    const linea = (r["lineas"] as Array<Record<string, unknown>>)[0]!;
+    expect(Number(linea["margen_final_pct"])).toBeGreaterThanOrEqual(1);
+  });
+
+  it("remember encodea [[about]] y recall filtra por parte", async () => {
+    knowledgeRows = [{ id: "k0", rule_text: "Los iPhone van al depto iPhone" }];
+    const deps = mockDeps();
+    const saved = await executeTool(
+      { name: "remember", args: { note: "afloja 2% con volumen", about: "planET" } },
+      deps,
+    );
+    expect(saved["guardada"]).toBe("[[planet]] afloja 2% con volumen");
+    const r = await executeTool({ name: "recall", args: { about: "planet" } }, deps);
+    expect(r["notas"]).toEqual(["[[planet]] afloja 2% con volumen"]);
+    expect(r["total_memoria"]).toBe(2);
+    const all = await executeTool({ name: "recall", args: {} }, deps);
+    expect((all["notas"] as string[]).length).toBe(2);
+  });
+});
+
+// ---------- domain del negociador (puro) ----------
+
+describe("Negociador — analyzeOffer (casos borde)", () => {
+  const now = Date.now();
+  const ref = (supplierId: string, price: number, ageMs = 0) => ({
+    supplierId,
+    price,
+    updatedAtMs: now - ageMs,
+  });
+
+  it("sin referencias → sin_referencia (y sin prev)", () => {
+    const a = analyzeOffer(500, "sp1", [], now);
+    expect(a.clasificacion).toBe("sin_referencia");
+    expect(a.min).toBeNull();
+    expect(a.prev_propio).toBeNull();
+  });
+
+  it("banda ±1.5%: mejora chica = en_linea; mejora real = oportunidad; arriba = caro", () => {
+    const refs = [ref("sp1", 600), ref("sp2", 640)];
+    expect(analyzeOffer(595, "sp3", refs, now).clasificacion).toBe("en_linea"); // −0.8%
+    expect(analyzeOffer(585, "sp3", refs, now).clasificacion).toBe("oportunidad"); // −2.5%
+    expect(analyzeOffer(620, "sp3", refs, now).clasificacion).toBe("caro"); // +3.3%
+    expect(analyzeOffer(585, "sp3", refs, now).vs_min_pct).toBe(-2.5);
+  });
+
+  it("prev_propio: delta vs el precio anterior del MISMO proveedor + frescura", () => {
+    const refs = [ref("sp1", 600, 10 * 24 * 3600 * 1000), ref("sp2", 590)];
+    const a = analyzeOffer(612, "sp1", refs, now);
+    expect(a.prev_propio?.price).toBe(600);
+    expect(a.prev_propio?.delta_pct).toBe(2);
+    expect(a.prev_propio?.fresh).toBe("expired"); // 10 días → ciclo vencido
+    expect(a.min?.supplierId).toBe("sp2");
+  });
+});
+
+describe("Negociador — selectLines / counterOffer / discountPlan / notas (puros)", () => {
+  const line = (over: Partial<import("../src/domain/negotiation").StagedLine>) => ({
+    aliasKey: "k",
+    rawName: "X",
+    modelId: "m",
+    modelName: "X",
+    categoryName: null,
+    price: 100,
+    tiers: [],
+    analysis: {
+      clasificacion: "en_linea" as const,
+      min: null,
+      mediana: null,
+      vs_min_pct: null,
+      prev_propio: null,
+    },
+    flags: [],
+    ...over,
+  });
+
+  it("selectLines: category ci, classification y all+except", () => {
+    const lines = [
+      line({ aliasKey: "a", modelName: "S26", categoryName: "Samsung Gama Alta" }),
+      line({ aliasKey: "b", modelName: "A17", categoryName: "Samsung Gama Baja" }),
+    ];
+    expect(selectLines(lines, { category: "samsung gama alta" }).selected.map((l) => l.aliasKey)).toEqual(["a"]);
+    expect(selectLines(lines, { all: true, except: ["a17"] }).selected.map((l) => l.aliasKey)).toEqual(["a"]);
+    expect(selectLines(lines, { models: ["s26"] }).rest.map((l) => l.aliasKey)).toEqual(["b"]);
+  });
+
+  it("counterOffer sin líneas caras → texto vacío", () => {
+    const neg = {
+      supplierId: "sp",
+      supplierName: "Bax",
+      ts: 0,
+      lines: [line({ analysis: { clasificacion: "oportunidad", min: null, mediana: null, vs_min_pct: null, prev_propio: null } })],
+    };
+    const r = counterOffer(neg, () => "X");
+    expect(r.lineas).toHaveLength(0);
+    expect(r.texto_whatsapp).toBe("");
+  });
+
+  it("discountPlan sostiene el margen fino aunque haya target", () => {
+    const plan = discountPlan(
+      [
+        { modelId: "a", modelName: "Gordo", qty: 10, cost: 500, lista: 560 }, // 10.7%
+        { modelId: "b", modelName: "Fino", qty: 10, cost: 500, lista: 506 }, // 1.2%
+      ],
+      { targetPct: 3, floorPct: 1 },
+    );
+    const gordo = plan.lineas.find((l) => l.modelName === "Gordo")!;
+    const fino = plan.lineas.find((l) => l.modelName === "Fino")!;
+    expect(gordo.sugerencia).toBe("conceder");
+    expect(fino.precio_final).toBe(506); // no se toca: ya está al piso
+    expect(fino.sugerencia).toBe("sostener");
+    expect(gordo.margen_final_pct).toBeGreaterThanOrEqual(1);
+    expect(plan.totales.descuento_pct).toBeGreaterThan(2.5);
+  });
+
+  it("notas: encode/decode [[about]], recall y orden por mención", () => {
+    expect(encodeNote("afloja 2%", "PlanET")).toBe("[[planet]] afloja 2%");
+    expect(noteAbout("[[ojus]] paga a 30 días")).toBe("ojus");
+    expect(noteAbout("regla general")).toBeNull();
+    const rules = ["[[ojus]] paga a 30 días", "regla general", "planET afloja con volumen"];
+    expect(recallNotes(rules, "ojus")).toEqual(["[[ojus]] paga a 30 días"]);
+    expect(orderNotesByMention(rules, ["planet"])[0]).toBe("planET afloja con volumen");
+    expect(orderNotesByMention(rules, [])).toEqual(rules);
   });
 });
 
