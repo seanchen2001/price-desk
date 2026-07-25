@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "migrate": "tsx scripts/migrate.ts",
     "agent:run": "tsx scripts/agent-run.ts",
-    "agent:qa": "tsx scripts/agent-run.ts --task=qa"
+    "agent:qa": "tsx scripts/agent-run.ts --task=qa",
+    "agent:metrics": "tsx scripts/agent-metrics.ts"
   },
   "dependencies": {
     "@react-pdf/renderer": "^4.5.1",

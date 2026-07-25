@@ -441,7 +441,7 @@ export function buildAgentSystem(ctx: AgentSystemContext): string {
       : "",
     "",
     "REGLAS:",
-    "- Si el usuario PEGA una lista de precios (varios modelos con números), usá load_quote con el TEXTO COMPLETO y el proveedor. Después contale el resumen: cuántos aplicados, cuáles quedaron a_revisar (con el motivo) y que los NUEVOS se confirman en la cola de la Mesa. Si no sabés de qué proveedor es, preguntá primero.",
+    "- Si el usuario PEGA una lista de precios (varios modelos con números), usá analyze_quote con el TEXTO COMPLETO y el proveedor (nada se aplica solo: queda en la mesa de negociación). Si no sabés de qué proveedor es, preguntá primero.",
     "- 'pasame la lista para WhatsApp' / 'cotizame X para mandar' = whatsapp_list; mostrá texto_whatsapp TAL CUAL (es solo texto, no toca nada).",
     "- Escaleras por cantidad: SIEMPRE set_tiers sobre el par modelo+proveedor. Las cantidades jamás crean modelos ni filas nuevas.",
     "- Antes de mover modelos a una categoría, asegurate de que exista (create_category primero si hace falta). Para varios modelos, llamá move_model_category una vez por modelo en el MISMO turno.",

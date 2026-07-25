@@ -756,14 +756,21 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
         clsRaw === "oportunidad" || clsRaw === "en_linea" || clsRaw === "caro" || clsRaw === "sin_referencia"
           ? (clsRaw as OfferClass)
           : undefined;
+      const modelsSel = strArr(args, "models");
+      const exceptSel = strArr(args, "except");
+      const categorySel = str(args, "category");
+      // "todo menos X": except solo (sin otro selector) implica all:true
+      const allSel =
+        args["all"] === true ||
+        (exceptSel.length > 0 && modelsSel.length === 0 && categorySel === "" && classification === undefined);
       const sel: LineSelector = {
-        models: strArr(args, "models"),
-        ...(str(args, "category") !== "" ? { category: str(args, "category") } : {}),
+        models: modelsSel,
+        ...(categorySel !== "" ? { category: categorySel } : {}),
         ...(classification !== undefined ? { classification } : {}),
-        all: args["all"] === true,
-        except: strArr(args, "except"),
+        all: allSel,
+        except: exceptSel,
       };
-      if ((sel.models?.length ?? 0) === 0 && sel.category === undefined && sel.classification === undefined && sel.all !== true) {
+      if (modelsSel.length === 0 && sel.category === undefined && sel.classification === undefined && sel.all !== true) {
         return {
           error:
             "Decime QUÉ aplicar: models[…], category, classification ('oportunidad'|'en_linea'|'caro') o all:true (+except).",
@@ -883,12 +890,17 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
         clsRaw === "oportunidad" || clsRaw === "en_linea" || clsRaw === "caro" || clsRaw === "sin_referencia"
           ? (clsRaw as OfferClass)
           : undefined;
+      const modelsSel = strArr(args, "models");
+      const exceptSel = strArr(args, "except");
+      const categorySel = str(args, "category");
       const sel: LineSelector = {
-        models: strArr(args, "models"),
-        ...(str(args, "category") !== "" ? { category: str(args, "category") } : {}),
+        models: modelsSel,
+        ...(categorySel !== "" ? { category: categorySel } : {}),
         ...(classification !== undefined ? { classification } : {}),
-        all: args["all"] === true,
-        except: strArr(args, "except"),
+        all:
+          args["all"] === true ||
+          (exceptSel.length > 0 && modelsSel.length === 0 && categorySel === "" && classification === undefined),
+        except: exceptSel,
       };
       const { selected, rest } = selectLines(staged.lines, sel);
       if (selected.length === 0) return { error: "Ningún renglón matchea ese selector." };

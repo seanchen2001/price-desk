@@ -464,6 +464,14 @@ describe("Negociador — analyze_quote stagea y clasifica (no aplica nada)", () 
     expect(deps.getStaged()?.lines[0]?.modelName).toBe("A17 4+128 DS");
   });
 
+  it("apply_lines con except SOLO implica all:true ('todo menos el A17')", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) }, negotiationSeed);
+    await stageNegotiation(deps);
+    const r = await executeTool({ name: "apply_lines", args: { except: ["A17"] } }, deps);
+    expect((r["aplicadas"] as unknown[]).length).toBe(1);
+    expect(r["quedan_en_mesa"]).toBe(1);
+  });
+
   it("apply_lines all + except ('todo menos el A17')", async () => {
     const deps = mockDeps({
       extractQuote: vi.fn(async () => quoteItems),

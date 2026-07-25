@@ -68,6 +68,8 @@ export function mockDeps(overrides: Partial<ToolDeps> = {}, seed?: MockSeed): To
     listSuppliers: async () => [
       { id: "s-bax", name: "Bax", active: true },
       { id: "s-sou", name: "South", active: true },
+      { id: "s-pla", name: "Planet", active: true },
+      { id: "s-vit", name: "Vitel", active: true },
     ],
     listPrices: async () => store.prices.map((r) => ({ ...r })),
     listTiers: async () => store.tiers.map((t) => ({ ...t })),
