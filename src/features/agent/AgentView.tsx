@@ -1,7 +1,8 @@
-// Panel LATERAL del agente (Fase 8) — paridad con el ChatBox del viejo: vive colapsable
-// a la derecha, disponible desde TODOS los tabs (la vista principal se encoge por flex).
-// Siempre MONTADO (display:none al colapsar) para que la conversación sobreviva al
-// abrir/cerrar; el estado abierto/cerrado persiste en localStorage (store.ts).
+// Panel LATERAL del agente — VISUAL 1:1 con el ChatBox del viejo (styles.js): aside
+// FIJO a la derecha (360px, #0f1420, borde #22304a) que se desliza con translateX al
+// colapsar (el shell corre el contenido con padding-right), pestaña vertical
+// "💬 ASISTENTE" para reabrir, burbujas agYou/agBot y tools en itálica gris.
+// Siempre MONTADO → la conversación sobrevive al abrir/cerrar; open persiste (store.ts).
 //
 // El motor no cambia respecto de Fase 8: el modelo PROPONE tool calls; executeTool las
 // ejecuta CLIENT-side vía la capa de datos (mutaciones por fila, identidad por
@@ -32,75 +33,6 @@ type ChatMsg =
 
 type PendingConfirm = { call: ToolCall; resolve: (ok: boolean) => void };
 
-const chatStyles = {
-  aside: {
-    width: 372,
-    flexShrink: 0,
-    position: "sticky" as const,
-    top: 10,
-    alignSelf: "flex-start" as const,
-    background: "#0b0f17",
-    border: "1px solid #1c2433",
-    borderRadius: 10,
-    padding: 10,
-    flexDirection: "column" as const,
-    gap: 8,
-    maxHeight: "calc(100vh - 24px)",
-  },
-  head: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    fontSize: 12,
-    fontWeight: 700,
-    color: "#8ea0bf",
-    letterSpacing: 0.4,
-  },
-  collapse: {
-    background: "transparent",
-    border: "none",
-    color: "#8b94a7",
-    cursor: "pointer",
-    fontSize: 13,
-  },
-  reopen: {
-    position: "fixed" as const,
-    right: 0,
-    top: "45%",
-    zIndex: 50,
-    background: "#1d2A44",
-    color: "#e6ebf5",
-    border: "1px solid #3b4a68",
-    borderRight: "none",
-    borderRadius: "8px 0 0 8px",
-    padding: "10px 6px",
-    cursor: "pointer",
-    fontSize: 12,
-    writingMode: "vertical-rl" as const,
-  },
-  log: {
-    background: "#0d1119",
-    border: "1px solid #1c2433",
-    borderRadius: 8,
-    padding: 10,
-    flex: 1,
-    minHeight: 220,
-    overflowY: "auto" as const,
-    display: "flex",
-    flexDirection: "column" as const,
-    gap: 6,
-  },
-  user: { color: "#e6ebf5", fontSize: 12.5, whiteSpace: "pre-wrap" as const },
-  agent: { color: "#9fd3a8", fontSize: 12.5, whiteSpace: "pre-wrap" as const },
-  tool: { color: "#6b7385", fontSize: 11, fontFamily: "monospace" },
-  error: { color: "#f87171", fontSize: 12 },
-  confirm: {
-    background: "#1a1410",
-    border: "1px solid #5a4a1d",
-    borderRadius: 8,
-    padding: "8px 10px",
-  },
-} as const;
 
 function argsPreview(args: Record<string, unknown>): string {
   const j = JSON.stringify(args);
@@ -256,49 +188,62 @@ export function AgentPanel(props: { activeTabLabel: string }) {
   return (
     <>
       {!open && (
-        <button onClick={() => setOpen(true)} style={chatStyles.reopen} title="Abrir el asistente">
+        <button onClick={() => setOpen(true)} style={s.chatReopen} title="Abrir el asistente">
           💬 ASISTENTE
         </button>
       )}
-      {/* siempre montado: display none al colapsar conserva la conversación */}
-      <aside style={{ ...chatStyles.aside, display: open ? "flex" : "none" }}>
-        <div style={chatStyles.head}>
+      {/* siempre montado: translateX al colapsar (como el viejo) conserva la conversación */}
+      <aside style={{ ...s.chatBox, transform: open ? "none" : "translateX(100%)" }}>
+        <div style={s.chatHead}>
           <span>💬 ASISTENTE</span>
-          <span style={{ fontWeight: 400, color: "#5b657a", fontSize: 10.5 }}>
+          <span style={{ fontWeight: 400, color: "#6b7385", fontSize: 10, letterSpacing: 0 }}>
             mirando: {props.activeTabLabel}
           </span>
           <button
             onClick={() => setOpen(false)}
             title="Colapsar hacia la derecha"
-            style={chatStyles.collapse}
+            style={s.chatCollapse}
           >
             ▶
           </button>
         </div>
 
-        <div style={chatStyles.log} ref={scrollRef}>
+        <div style={s.chatResults} ref={scrollRef}>
           {messages.length === 0 && (
-            <div style={s.hint}>
+            <div style={s.chatEmpty}>
               Tools tipadas sobre la base real (el agente propone; el código ejecuta vía el
               resolvedor). Ej.: “creá la categoría Samsung Gama Alta y mové el S26 ahí” ·
-              “cargá S26 12+512 a 610 de Bax con escala 20→605 50→595” · “¿cómo vienen las
-              cuentas?” · “¿mejor proveedor para 30 S26?”
+              “cargá S26 12+512 a 610 de Bax con escala 20→605 50→595” · pegá una lista de
+              proveedor para cargarla · “¿mejor proveedor para 30 S26?”
             </div>
           )}
-          {messages.map((m, i) => (
-            <div key={i} style={chatStyles[m.kind]}>
-              {m.kind === "user" ? "» " : ""}
-              {m.text}
-            </div>
-          ))}
-          {busy && !pending && <div style={s.hint}>pensando…</div>}
+          {messages.map((m, i) =>
+            m.kind === "user" ? (
+              <div key={i} style={s.agYou}>
+                {m.text}
+              </div>
+            ) : m.kind === "agent" ? (
+              <div key={i} style={s.agBot}>
+                {m.text}
+              </div>
+            ) : m.kind === "tool" ? (
+              <div key={i} style={s.agTool}>
+                {m.text}
+              </div>
+            ) : (
+              <div key={i} style={{ ...s.errorMsg, marginTop: 0 }}>
+                {m.text}
+              </div>
+            ),
+          )}
+          {busy && !pending && <div style={s.agTool}>pensando…</div>}
         </div>
 
         {pending && (
-          <div style={chatStyles.confirm}>
-            <div style={{ fontSize: 12, color: "#e6c98b", marginBottom: 6 }}>
+          <div style={s.newWrap}>
+            <div style={{ fontSize: 11.5, color: "#6fa8e6", fontWeight: 600, marginBottom: 8 }}>
               Acción destructiva propuesta:
-              <code style={{ marginLeft: 6 }}>
+              <code style={{ marginLeft: 6, color: "#fbbf24" }}>
                 {pending.call.name}({argsPreview(pending.call.args)})
               </code>
             </div>
@@ -325,30 +270,32 @@ export function AgentPanel(props: { activeTabLabel: string }) {
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 6 }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && void send()}
-            placeholder="Pedile algo… (Enter envía)"
-            style={{ ...s.textInput, flex: 1, minWidth: 0 }}
-            disabled={busy}
-          />
-          <button
-            onClick={() => void send()}
-            disabled={busy || !input.trim()}
-            style={{ ...s.primaryBtn, ...(busy ? s.busy : {}) }}
-          >
-            {busy ? "…" : "Enviar"}
-          </button>
-          <button
-            onClick={reset}
-            style={{ ...s.toolBtn, ...s.toolBtnGhost }}
-            disabled={busy}
-            title="Nueva conversación"
-          >
-            ⟲
-          </button>
+        <div style={s.chatInputWrap}>
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void send()}
+              placeholder="Pedile algo… (Enter envía)"
+              style={{ ...s.chatInput, flex: 1, minWidth: 0 }}
+              disabled={busy}
+            />
+            <button
+              onClick={() => void send()}
+              disabled={busy || !input.trim()}
+              style={{ ...s.primaryBtn, ...(busy ? s.busy : {}) }}
+            >
+              {busy ? "…" : "Enviar"}
+            </button>
+            <button
+              onClick={reset}
+              style={s.chatCollapse}
+              disabled={busy}
+              title="Nueva conversación"
+            >
+              ⟲
+            </button>
+          </div>
         </div>
       </aside>
     </>

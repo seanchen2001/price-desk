@@ -967,7 +967,7 @@ export function OrdenesView({ editInvoiceId, onDoneEditing, onLoadImeis }: Orden
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.6)",
+            background: "rgba(3,6,12,0.72)",
             zIndex: 1000,
             display: "flex",
             alignItems: "center",
@@ -977,8 +977,8 @@ export function OrdenesView({ editInvoiceId, onDoneEditing, onLoadImeis }: Orden
         >
           <div
             style={{
-              background: "#0e1218",
-              border: "1px solid #273246",
+              background: "#0f1420",
+              border: "1px solid #2a4a75",
               borderRadius: 8,
               padding: 16,
               width: "min(460px, 96vw)",

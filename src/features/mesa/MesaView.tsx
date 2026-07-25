@@ -118,7 +118,6 @@ export function MesaView() {
   const removeFromQueue = useConfirmQueue((st) => st.remove);
   // selección para la cotización WhatsApp
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
-  const [waText, setWaText] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   // depto inicial: Teléfonos (cuando llega la lista)
@@ -176,28 +175,32 @@ export function MesaView() {
     });
   };
 
-  // texto WhatsApp: formato del viejo (categoría en *negrita*, "NOMBRE<TAB>$precio",
-  // grupos separados por línea en blanco); precio = Lista manual ?? Mín+margen
-  const buildWhatsapp = () => {
-    const groups: WhatsappGroup[] = [];
-    for (const g of data.groups) {
-      const items = g.rows
-        .filter((v) => selectedIds.has(v.row.model.id))
-        .map((v) => ({
-          label: v.label,
-          price: listaPrice(v.row.salePrice, v.row.agg.min, v.row.minAny, marginPct),
-        }))
-        .map((r) => ({ name: r.label, price: r.price }));
-      if (items.length) groups.push({ category: g.category, items });
-    }
-    setCopied(false);
-    setWaText(whatsappQuoteText(groups));
-  };
+  // marcado masivo (paridad con "Marcar: Todo / Con precio / Ninguno" del viejo)
+  const allRowIds = data.groups.flatMap((g) => g.rows.map((v) => v.row.model.id));
+  const pricedRowIds = data.groups.flatMap((g) =>
+    g.rows.filter((v) => v.row.agg.min !== null).map((v) => v.row.model.id),
+  );
+  const selectAll = () => setSelectedIds(new Set(allRowIds));
+  const selectPriced = () => setSelectedIds(new Set(pricedRowIds));
+  const selectNone = () => setSelectedIds(new Set());
+
+  // texto WhatsApp EN VIVO (como el quoteText del viejo): categoría en *negrita*,
+  // "NOMBRE<TAB>$precio", grupos separados por línea en blanco; Lista manual ?? Mín+margen
+  const quoteGroups: WhatsappGroup[] = [];
+  for (const g of data.groups) {
+    const items = g.rows
+      .filter((v) => selectedIds.has(v.row.model.id))
+      .map((v) => ({
+        name: v.label,
+        price: listaPrice(v.row.salePrice, v.row.agg.min, v.row.minAny, marginPct),
+      }));
+    if (items.length) quoteGroups.push({ category: g.category, items });
+  }
+  const quoteText = whatsappQuoteText(quoteGroups);
 
   const copyWhatsapp = async () => {
-    if (waText === null) return;
     try {
-      await navigator.clipboard.writeText(waText);
+      await navigator.clipboard.writeText(quoteText);
       setCopied(true);
     } catch (e) {
       console.error("clipboard falló:", e);
@@ -209,44 +212,12 @@ export function MesaView() {
 
   return (
     <div>
-      {/* tabs por departamento */}
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-        {data.departments.map((d) => (
-          <button
-            key={d.id}
-            onClick={() => setSelectedDeptId(d.id)}
-            style={{ ...s.planTab, ...(selectedDeptId === d.id ? s.planTabOn : {}) }}
-          >
-            {d.name}
-          </button>
-        ))}
-      </div>
-
-      {/* toolbar */}
+      {/* toolbar (orden del viejo: snapshot · Lista=Mín+% · nota; Client % acá porque es estado de la Mesa) */}
       <div style={s.toolbar}>
         <button style={{ ...s.toolBtn, ...s.toolBtnDisabled }} disabled title="Fase posterior">
-          Save snapshot (Fase posterior)
+          Save snapshot
         </button>
-        <button
-          onClick={buildWhatsapp}
-          disabled={selectedIds.size === 0}
-          style={{ ...s.toolBtn, ...(selectedIds.size === 0 ? s.toolBtnDisabled : {}) }}
-          title="Marcá modelos con los checkbox de la grilla (o por categoría) y generá el texto"
-        >
-          Cotización WhatsApp ({selectedIds.size})
-        </button>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12 }}>
-          Client +
-          <input
-            type="number"
-            value={marginPct}
-            onChange={(e) => setMarginPct(Number(e.target.value) || 0)}
-            step="0.5"
-            style={s.numInput}
-          />
-          %
-        </span>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+        <span style={s.listaFill}>
           Lista = Mín +
           <input
             type="number"
@@ -264,43 +235,19 @@ export function MesaView() {
             Pegar en Lista
           </button>
         </span>
-        <label style={{ ...s.hideToggle, marginLeft: "auto" }}>
+        <span style={s.listaFill}>
+          Client = Mín +
           <input
-            type="checkbox"
-            checked={hideEmpty}
-            onChange={(e) => setHideEmpty(e.target.checked)}
-            style={s.chk}
+            type="number"
+            value={marginPct}
+            onChange={(e) => setMarginPct(Number(e.target.value) || 0)}
+            step="0.5"
+            style={s.numInput}
           />
-          Ocultar sin precio {hideEmpty && data.emptyCount > 0 && `(${data.emptyCount})`}
-        </label>
+          %
+        </span>
         <span style={s.toolNote}>los precios expiran cada lunes</span>
       </div>
-
-      {waText !== null && (
-        <section style={s.section}>
-          <div style={s.sectionTitle}>
-            Cotización WhatsApp — {selectedIds.size} modelo(s) · Lista (o Mín +{marginPct}%)
-          </div>
-          <textarea readOnly value={waText} rows={Math.min(14, waText.split("\n").length + 1)} style={{ ...s.textarea, width: "100%" }} />
-          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-            <button onClick={() => void copyWhatsapp()} style={s.primaryBtn}>
-              {copied ? "¡Copiado!" : "Copiar para WhatsApp"}
-            </button>
-            <button
-              onClick={() => {
-                setSelectedIds(new Set());
-                setWaText(null);
-              }}
-              style={{ ...s.toolBtn, ...s.toolBtnGhost }}
-            >
-              Limpiar selección
-            </button>
-            <button onClick={() => setWaText(null)} style={{ ...s.toolBtn, ...s.toolBtnGhost }}>
-              Cerrar
-            </button>
-          </div>
-        </section>
-      )}
 
       <PastePanel onQueue={enqueue} />
       <ConfirmQueue
@@ -310,11 +257,48 @@ export function MesaView() {
       />
       <CategoriesPanel />
 
+      {/* tabla comparativa (estructura del viejo: dept tabs → tableBar → tabla) */}
       <section style={s.section}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+          {data.departments.map((d) => (
+            <button
+              key={d.id}
+              onClick={() => setSelectedDeptId(d.id)}
+              style={{ ...s.planTab, ...(selectedDeptId === d.id ? s.planTabOn : {}) }}
+            >
+              {d.name}
+            </button>
+          ))}
+        </div>
+        <div style={s.tableBar}>
+          <label style={s.hideToggle}>
+            <input
+              type="checkbox"
+              checked={hideEmpty}
+              onChange={(e) => setHideEmpty(e.target.checked)}
+              style={s.chk}
+            />
+            Ocultar sin precio
+            {hideEmpty && data.emptyCount > 0 && <span style={s.hideCount}> ({data.emptyCount})</span>}
+          </label>
+          <span style={s.markGroup}>
+            <span style={s.hideCount}>Marcar:</span>
+            <button onClick={selectAll} style={s.miniBtn}>
+              Todo
+            </button>
+            <button onClick={selectPriced} style={s.miniBtn}>
+              Con precio
+            </button>
+            <button onClick={selectNone} style={s.miniBtn}>
+              Ninguno
+            </button>
+            <span style={s.hideCount}>{selectedIds.size} marcado(s)</span>
+          </span>
+        </div>
         {data.loading ? (
-          <div style={s.hint}>Cargando la Mesa…</div>
+          <div style={s.askHint}>Cargando la Mesa…</div>
         ) : totalRows === 0 ? (
-          <div style={s.hint}>
+          <div style={s.askHint}>
             No hay modelos en este departamento todavía. Pegá una lista arriba: los que no
             existan van a la cola de confirmación y ahí los creás con su departamento y
             categoría.
@@ -331,6 +315,32 @@ export function MesaView() {
             selectedIds={selectedIds}
             onToggleRows={onToggleRows}
           />
+        )}
+      </section>
+
+      {/* cotización al cliente (para WhatsApp) — sección de abajo, como el viejo */}
+      <section style={s.section}>
+        <div style={s.sectionTitle}>
+          COTIZACIÓN AL CLIENTE — {selectedIds.size} modelo(s) marcado(s)
+        </div>
+        {selectedIds.size === 0 ? (
+          <div style={s.askHint}>
+            Marcá con el checkbox (al lado de cada modelo en la tabla, o el de la categoría)
+            lo que te pidió el cliente. Acá se arma el texto para WhatsApp.
+          </div>
+        ) : (
+          <>
+            <div style={s.quoteBar}>
+              <button onClick={selectNone} style={{ ...s.toolBtn, ...s.toolBtnGhost }}>
+                Limpiar
+              </button>
+              <button onClick={() => void copyWhatsapp()} style={s.copyBtn}>
+                {copied ? "¡Copiado!" : "Copiar para WhatsApp"}
+              </button>
+            </div>
+            <div style={s.quotePreviewLabel}>Vista previa (esto se copia):</div>
+            <pre style={s.quotePreview}>{quoteText}</pre>
+          </>
         )}
       </section>
     </div>

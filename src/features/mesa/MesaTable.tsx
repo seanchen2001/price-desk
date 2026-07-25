@@ -36,8 +36,9 @@ function ResizableTh(props: {
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
   };
+  // OJO: s.th ya es sticky (top 0, como el viejo) — el grip absoluto se ancla al th sticky.
   return (
-    <th style={{ ...s.th, ...props.style, width, position: "relative" }}>
+    <th style={{ ...s.th, ...props.style, width }}>
       {props.children}
       <span
         onMouseDown={onDown}
