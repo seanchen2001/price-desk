@@ -3,10 +3,12 @@
 // precios aplicados al model_id correcto, escalas en price_tiers (LA FILA ES UNA),
 // lo genuinamente nuevo queda en cola (no en la base).
 //
-// DECISIÓN (anotada): el seed que deja este test ES la demo coherente de la base
-// (departments/categories/proveedores/4 modelos con precios y escala) — se re-corre
-// idempotente. Solo lo efímero (modelo del flujo "crear desde la cola" y el alias del
-// flujo "vincular") se limpia al final.
+// DECISIÓN (Fase 9): la base ya tiene los datos REALES migrados — este test NO puede
+// tocar modelos reales (antes sembraba "S26 12+512 5G DS" de verdad y pisaba precios y
+// escalas migrados). Ahora TODOS los modelos del test llevan el stamp y se borran al
+// final (cascade limpia aliases/prices/tiers/history). Los proveedores planET/VITEL se
+// reutilizan si existen (solo se les agregan precios de modelos del test, que caen con
+// el cascade del modelo).
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -61,23 +63,6 @@ const serviceKey = env["SUPABASE_SERVICE_KEY"] ?? "";
 const hasEnv = url !== "" && serviceKey !== "";
 const TIMEOUT = 30_000;
 
-// el quote del AC: escalas + variante regional + prefijo "Galaxy" + un modelo nuevo
-const QUOTE = [
-  "S26 12+512 5G DS (20 pcs) 610",
-  "S26 12+512 5G DS (50+ pcs) 595",
-  "Galaxy S26 12+512 5G DS 620",
-  "iPhone 17 Pro 256GB Blue US Specs 999",
-  "iPhone 18 Fold 1TB 1500",
-].join("\n");
-
-// seed demo (queda en la base): modelos reales con depto/categoría
-const DEMO_MODELS: ReadonlyArray<{ name: string; dept: string; cat: string }> = [
-  { name: "S26 12+512 5G DS", dept: "Teléfonos", cat: "Samsung" },
-  { name: "S26 ULTRA 12/512GB 5G", dept: "Teléfonos", cat: "Samsung" },
-  { name: "iPhone 17 Pro 256GB Blue", dept: "iPhone", cat: "iPhone" },
-  { name: "iPhone 17 Pro 256GB Orange", dept: "iPhone", cat: "iPhone" },
-];
-
 describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicados (AC)", () => {
   let db: Db;
   let repo: typeof import("../src/data/resolverRepo");
@@ -85,6 +70,29 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
   let departments: typeof import("../src/data/departments");
 
   const stamp = `f5it${Date.now()}`;
+
+  // modelos DEL TEST (stampeados — jamás nombres reales del catálogo migrado)
+  const S26 = `S26 ${stamp} 12+512 5G DS`;
+  const IPHONE_BLUE = `iPhone ${stamp} 17 Pro 256GB Blue`;
+  const IPHONE_ORANGE = `iPhone ${stamp} 17 Pro 256GB Orange`;
+  const S26_ULTRA = `S26 ULTRA ${stamp} 12/512GB 5G`;
+  const NEW_MODEL = `iPhone ${stamp} 18 Fold 1TB`;
+
+  // el quote del AC: escalas + variante regional + prefijo "Galaxy" + un modelo nuevo
+  const QUOTE = [
+    `${S26} (20 pcs) 610`,
+    `${S26} (50+ pcs) 595`,
+    `Galaxy ${S26} 620`,
+    `${IPHONE_BLUE} US Specs 999`,
+    `${NEW_MODEL} 1500`,
+  ].join("\n");
+
+  const DEMO_MODELS: ReadonlyArray<{ name: string; dept: string; cat: string }> = [
+    { name: S26, dept: "Teléfonos", cat: "Samsung" },
+    { name: S26_ULTRA, dept: "Teléfonos", cat: "Samsung" },
+    { name: IPHONE_BLUE, dept: "iPhone", cat: "iPhone" },
+    { name: IPHONE_ORANGE, dept: "iPhone", cat: "iPhone" },
+  ];
   let planetId = "";
   let vitelId = "";
   let s26Id = "";
@@ -115,6 +123,7 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
       { department_id: await idByName("departments", dept), category_id: await idByName("categories", cat) },
       db,
     );
+    ephemeralModelIds.push(model.id); // stampeado: se limpia SIEMPRE al final
     return model.id;
   }
 
@@ -148,17 +157,17 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
     apply = await import("../src/features/mesa/applyQuote");
     departments = await import("../src/data/departments");
 
-    // seed idempotente: departamentos + categorías + proveedores + modelos demo
+    // seed: departamentos + categorías (idempotente) + modelos DEL TEST (stampeados)
     await departments.ensureCatalogSeed(db);
     planetId = await supplierIdByName("planET");
     vitelId = await supplierIdByName("VITEL");
     for (const m of DEMO_MODELS) await ensureModel(m.name, m.dept, m.cat);
-    s26Id = await ensureModel("S26 12+512 5G DS", "Teléfonos", "Samsung");
-    iphoneBlueId = await ensureModel("iPhone 17 Pro 256GB Blue", "iPhone", "iPhone");
+    s26Id = await ensureModel(S26, "Teléfonos", "Samsung");
+    iphoneBlueId = await ensureModel(IPHONE_BLUE, "iPhone", "iPhone");
   }, TIMEOUT);
 
   afterAll(async () => {
-    // limpiar SOLO lo efímero; la demo queda
+    // limpiar TODO lo del test (models cascadea aliases/prices/tiers/history)
     for (const key of ephemeralAliasKeys) {
       await db.from("model_aliases").delete().eq("alias_key", key);
     }
@@ -182,28 +191,28 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
       expect([...byModel.keys()].sort()).toEqual([s26Id, iphoneBlueId].sort());
       // única candidata: la línea genuinamente nueva → cola, NO base
       expect(plan.candidates).toHaveLength(1);
-      expect(plan.candidates[0]!.entry.rawName).toBe("iPhone 18 Fold 1TB");
+      expect(plan.candidates[0]!.entry.rawName).toBe(NEW_MODEL);
 
       // aplicar los matches (lo que hace el botón "Aplicar")
       for (const m of plan.matched) await apply.applyEntry(m.modelId, planetId, m.entry, db);
-      // precio de un segundo proveedor para que Mín/Medio tengan sentido en la demo
+      // precio de un segundo proveedor para que Mín/Medio tengan sentido
       await apply.applyEntry(
         s26Id,
         vitelId,
-        { rawName: "S26 12+512 5G DS", aliasKey: normalize("S26 12+512 5G DS"), price: 618, tiers: [], lines: [] },
+        { rawName: S26, aliasKey: normalize(S26), price: 618, tiers: [], lines: [] },
         db,
       );
 
       // ★ CERO modelos auto-creados: cada línea del quote sigue resolviendo a los modelos
       // sembrados (ninguna variante bifurcó) y el candidato nuevo NO existe en la base
-      for (const line of ["S26 12+512 5G DS (20 pcs)", "Galaxy S26 12+512 5G DS"]) {
+      for (const line of [`${S26} (20 pcs)`, `Galaxy ${S26}`]) {
         expect(await repo.resolveModelAsync(line, {}, db)).toEqual({ modelId: s26Id });
       }
-      expect(await repo.resolveModelAsync("iPhone 17 Pro 256GB Blue US Specs", {}, db)).toEqual({
+      expect(await repo.resolveModelAsync(`${IPHONE_BLUE} US Specs`, {}, db)).toEqual({
         modelId: iphoneBlueId,
       });
-      expect(await modelExistsForKey(normalize("iPhone 18 Fold 1TB"))).toBe(false);
-      expect(await countModelsNamed("iPhone 18 Fold 1TB")).toBe(0);
+      expect(await modelExistsForKey(normalize(NEW_MODEL))).toBe(false);
+      expect(await countModelsNamed(NEW_MODEL)).toBe(0);
 
       // precios al model_id correcto (S26: el mejor de la escalera, semántica del viejo)
       const s26Price = await db
@@ -238,7 +247,7 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
       ]);
 
       // el candidato NO existe en la base: re-resolver lo sigue dando como nuevo
-      const again = await repo.resolveModelAsync("iPhone 18 Fold 1TB", {}, db);
+      const again = await repo.resolveModelAsync(NEW_MODEL, {}, db);
       expect("candidateNew" in again).toBe(true);
     },
     TIMEOUT,
@@ -253,9 +262,9 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
       expect(plan.candidates).toHaveLength(1);
       for (const m of plan.matched) await apply.applyEntry(m.modelId, planetId, m.entry, db);
       // sigue habiendo UN solo modelo por identidad (upsert por fila, cero bifurcación)
-      expect(await countModelsNamed("S26 12+512 5G DS")).toBe(1);
-      expect(await countModelsNamed("iPhone 17 Pro 256GB Blue")).toBe(1);
-      expect(await modelExistsForKey(normalize("iPhone 18 Fold 1TB"))).toBe(false);
+      expect(await countModelsNamed(S26)).toBe(1);
+      expect(await countModelsNamed(IPHONE_BLUE)).toBe(1);
+      expect(await modelExistsForKey(normalize(NEW_MODEL))).toBe(false);
     },
     TIMEOUT,
   );
@@ -263,7 +272,7 @@ describe.skipIf(!hasEnv)("Fase 5 — Mesa: paste → resolver → cero duplicado
   it(
     "cola de confirmación — 'vincular a existente' escribe el alias y aplica el precio",
     async () => {
-      const aliasText = `S26 12+512 5G DS PROMO ${stamp}`; // variante que normalize NO pliega
+      const aliasText = `${S26} PROMO`; // variante que normalize NO pliega
       const r = await repo.resolveModelAsync(aliasText, {}, db);
       expect("candidateNew" in r).toBe(true);
 

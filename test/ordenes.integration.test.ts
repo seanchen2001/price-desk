@@ -1,8 +1,9 @@
 // Fase 6 — verificación del AC contra el Supabase REAL (service key): flujo end-to-end
 // draft → facturar → invoice + invoice_items + invoice_item_units en la base → cargar
 // IMEIs/series por unidad → editar la factura (reconciliación por fila) → soft-delete.
-// Usa los modelos/proveedores demo sembrados en Fase 5 y crea un cliente/envío demo
-// (quedan como demo idempotente); la factura y el draft del test se limpian al final.
+// DECISIÓN (Fase 9): la base tiene los datos REALES migrados — el test siembra SUS
+// propios modelos/cliente/envío (stampeados, jamás nombres reales) y limpia TODO al
+// final; los proveedores planET/VITEL se reutilizan sin pisarles datos reales.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -75,6 +76,11 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
   let misc: typeof import("../src/data/misc");
 
   const stamp = `F6TEST-${Date.now()}`; // no NO numérico → no pisa la numeración real
+  // nombres DEL TEST (stampeados — jamás modelos/clientes reales de la base migrada)
+  const S26_NAME = `S26 ${stamp} 12+512 5G DS`;
+  const IPHONE_NAME = `iPhone ${stamp} 17 Pro 256GB Blue`;
+  const CLIENT_NAME = `Cliente Demo ${stamp}`;
+  const SHIP_LABEL = `Depósito Demo ${stamp}`;
   let clientId = "";
   let shipId = "";
   let planetId = "";
@@ -83,6 +89,7 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
   let iphoneId = "";
   let invoiceId = "";
   let draftId = "";
+  const createdModelIds: string[] = [];
 
   async function supplierId(name: string, code: string): Promise<string> {
     const found = await db.from("suppliers").select("id").eq("name", name).maybeSingle();
@@ -111,30 +118,22 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
     return ins.data.id;
   }
 
-  async function modelIdByName(name: string): Promise<string> {
-    const res = await db.from("models").select("id").eq("canonical_name", name).limit(1);
-    if (res.error) throw res.error;
-    const row = res.data[0];
-    if (!row) throw new Error(`Falta el modelo demo de Fase 5: ${name} (corré mesa.integration primero)`);
-    return row.id;
-  }
-
   beforeAll(async () => {
     const { createClient } = await import("@supabase/supabase-js");
     db = createClient<Database>(url, serviceKey);
     facturar = await import("../src/data/facturar");
     invoicesRepo = await import("../src/data/invoices");
     misc = await import("../src/data/misc");
+    const repo = await import("../src/data/resolverRepo");
 
-    // demo de Fase 5: modelos con precios/escala ya sembrados por mesa.integration
-    s26Id = await modelIdByName("S26 12+512 5G DS");
-    iphoneId = await modelIdByName("iPhone 17 Pro 256GB Blue");
+    // modelos PROPIOS del test (con self-alias, flujo canónico)
+    s26Id = (await repo.createModelWithAlias(S26_NAME, {}, db)).id;
+    iphoneId = (await repo.createModelWithAlias(IPHONE_NAME, {}, db)).id;
+    createdModelIds.push(s26Id, iphoneId);
     planetId = await supplierId("planET", "PL");
     vitelId = await supplierId("VITEL", "Vit");
-    // asegurar el code corto del remito (columna suppliers.code)
-    await db.from("suppliers").update({ code: "PL" }).eq("id", planetId);
 
-    // asegurar precios base (por si la demo se corrió hace tiempo)
+    // precios base de los modelos del test (caen con el cascade al borrar el modelo)
     await db.from("prices").upsert(
       [
         { model_id: s26Id, supplier_id: planetId, price: 620 },
@@ -152,16 +151,16 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
       { onConflict: "model_id,supplier_id,min_qty" },
     );
 
-    // cliente + envío demo (idempotentes, quedan como demo de la base)
+    // cliente + envío PROPIOS del test (se limpian al final)
     clientId = await demoClientId({
-      name: "Cliente Demo Fase 6",
+      name: CLIENT_NAME,
       address: "Av. Siempre Viva 742\nCiudad del Este",
       ruc: "80099887-1",
       phone: "0991 555 111",
       cuenta_corriente: true,
     });
     shipId = await demoShipId({
-      label: "Depósito Demo Miami",
+      label: SHIP_LABEL,
       notify: "Ojus LLC",
       direccion: "2100 NW 92nd Ave, Miami FL",
       telefono: "305 555 0100",
@@ -170,9 +169,12 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
   }, TIMEOUT);
 
   afterAll(async () => {
-    // limpiar lo efímero del test (el cliente/envío demo quedan)
+    // limpiar TODO lo del test (la factura primero: referencia cliente/envío)
     if (invoiceId) await db.from("invoices").delete().eq("id", invoiceId); // cascade items/units/ops
     if (draftId) await db.from("drafts").delete().eq("id", draftId);
+    for (const id of createdModelIds) await db.from("models").delete().eq("id", id); // cascade prices/tiers/aliases
+    if (clientId) await db.from("clients").delete().eq("id", clientId);
+    if (shipId) await db.from("shippings").delete().eq("id", shipId);
   }, TIMEOUT);
 
   function buildOrder(): OrderState {
@@ -187,7 +189,7 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
     const items: OrderLine[] = [
       {
         modelId: s26Id,
-        modelName: "S26 12+512 5G DS",
+        modelName: S26_NAME,
         category: "Samsung",
         qty: 25,
         color: "BLACK",
@@ -202,7 +204,7 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
       },
       {
         modelId: iphoneId,
-        modelName: "iPhone 17 Pro 256GB Blue",
+        modelName: IPHONE_NAME,
         category: "iPhone",
         qty: 2,
         color: "BLUE",
@@ -264,7 +266,7 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
       expect(Number(invoice.cost)).toBe(totals.cost);
       expect(Number(invoice.margin)).toBe(totals.margin);
       const snap = invoice.client_pdf as Record<string, unknown>;
-      expect(snap["name"]).toBe("Cliente Demo Fase 6");
+      expect(snap["name"]).toBe(CLIENT_NAME);
       expect(snap["notify"]).toBe("Ojus LLC");
       // order_meta persistido dentro del snapshot (re-descarga fiel del template)
       expect((snap["order_meta"] as Record<string, unknown>)["payment"]).toBe("W/T");
@@ -316,7 +318,7 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
       // filas del Excel desde la base: una por unidad, IMEI como string
       const rows = buildImeiRows([
         {
-          modelName: "iPhone 17 Pro 256GB Blue",
+          modelName: IPHONE_NAME,
           category: "iPhone",
           qty: 2,
           imeis: units.map((u) => u.imei ?? ""),
@@ -340,7 +342,7 @@ describe.skipIf(!hasEnv)("Fase 6 — Órdenes → factura + IMEIs por unidad (AC
       const line0 = order.items[0]!;
       const kept: OrderLine = { ...line0, itemId: s26Item.id, qty: 30, imeis: [], serials: [] };
       const edited: OrderState = { ...order, items: [kept] };
-      const clientPdf = buildClientPdf({ name: "Cliente Demo Fase 6" }, null, "");
+      const clientPdf = buildClientPdf({ name: CLIENT_NAME }, null, "");
       const { invoice, items } = await facturar.updateInvoiceFromOrder(
         invoiceId,
         { order: edited, type: "factura", clientId, shipId, clientPdf },
