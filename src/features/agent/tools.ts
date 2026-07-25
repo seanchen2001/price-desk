@@ -150,6 +150,33 @@ const DECLARATIONS: Declaration[] = [
       required: ["model", "supplier"],
     },
   },
+  {
+    name: "load_quote",
+    description:
+      "Carga a la Mesa una LISTA DE PRECIOS que el usuario pegó en el chat (texto crudo del proveedor). Extrae con IA, resuelve identidad con el resolvedor y: aplica solo los precios sanos (delta ≤ ±15% y sin flags), lista los sospechosos en a_revisar (NO se aplican) y manda los modelos nuevos a la cola de confirmación de la Mesa (nada se crea solo). Usala SIEMPRE que el usuario pegue una cotización con varios modelos+precios. Pasá el texto COMPLETO tal cual.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        supplier: STR("Proveedor de la lista (existente; si no está claro, preguntá antes)."),
+        text: STR("La lista COMPLETA tal cual la pegó el usuario (no la resumas)."),
+      },
+      required: ["supplier", "text"],
+    },
+  },
+  {
+    name: "whatsapp_list",
+    description:
+      "Arma el texto de cotización para WhatsApp (agrupado por categoría en *negrita*, precio de Lista o Mín+margen). Filtrable por departamento, categoría y/o texto del modelo. Devuelve texto listo para copiar — NO toca la base.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        department: STR("Departamento (opcional)."),
+        category: STR("Categoría (opcional)."),
+        filter: STR("Filtro por texto del nombre (opcional, ej. 'S26')."),
+        margin_pct: NUM("Margen % para el fallback Mín+margen (default 3)."),
+      },
+    },
+  },
   // ---------- consulta / briefing ----------
   {
     name: "get_mesa_summary",
@@ -223,6 +250,7 @@ export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   "set_tiers",
   "set_sale_price",
   "delete_price",
+  "load_quote",
 ]);
 
 export type AgentSystemContext = {
@@ -259,6 +287,8 @@ export function buildAgentSystem(ctx: AgentSystemContext): string {
       : "",
     "",
     "REGLAS:",
+    "- Si el usuario PEGA una lista de precios (varios modelos con números), usá load_quote con el TEXTO COMPLETO y el proveedor. Después contale el resumen: cuántos aplicados, cuáles quedaron a_revisar (con el motivo) y que los NUEVOS se confirman en la cola de la Mesa. Si no sabés de qué proveedor es, preguntá primero.",
+    "- 'pasame la lista para WhatsApp' / 'cotizame X para mandar' = whatsapp_list; mostrá texto_whatsapp TAL CUAL (es solo texto, no toca nada).",
     "- Escaleras por cantidad: SIEMPRE set_tiers sobre el par modelo+proveedor. Las cantidades jamás crean modelos ni filas nuevas.",
     "- Antes de mover modelos a una categoría, asegurate de que exista (create_category primero si hace falta). Para varios modelos, llamá move_model_category una vez por modelo en el MISMO turno.",
     "- Perspectiva trader: el proveedor nos VENDE (su precio es nuestro costo); el cliente nos COMPRA (side 'client' = nos debe).",

@@ -18,7 +18,14 @@ import { rowAggregates } from "../../domain/pricing";
 import { clientPulse, type PulseClient, type PulseOps } from "../../domain/pulse";
 import { resolveModel } from "../../domain/resolver";
 import type { ResolverRepo } from "../../domain/resolver";
-import type { QuoteTier } from "../../domain/quoteParser";
+import type { QuoteEntry, QuoteTier } from "../../domain/quoteParser";
+import { listaPrice, whatsappQuoteText, type WhatsappGroup } from "../../domain/whatsapp";
+import {
+  checkQuoteEntry,
+  extractedToQuoteEntries,
+  PRICE_AUTO_THRESHOLD,
+  type ExtractedItem,
+} from "./extraction";
 
 export type ToolCall = { name: string; args: Record<string, unknown> };
 export type ToolResult = Record<string, unknown>;
@@ -78,7 +85,68 @@ export type ToolDeps = {
   deletePrice: (pair: { model_id: string; supplier_id: string }) => Promise<void>;
   upsertSalePrice: (row: { model_id: string; price: number; manual: boolean }) => Promise<void>;
   deleteSalePrice: (modelId: string) => Promise<void>;
+  // tubería propose-only de cotizaciones (load_quote desde el chat)
+  extractQuote: (input: { text: string }) => Promise<ExtractedItem[]>;
+  /** applyEntry de la Mesa: precio por fila + history + escalera del par */
+  applyQuoteEntry: (modelId: string, supplierId: string, entry: QuoteEntry) => Promise<void>;
+  /** encola candidatos NUEVOS en la cola de confirmación de la Mesa (humano decide) */
+  queueCandidates: (
+    items: Array<{ entry: QuoteEntry; aliasKey: string; supplierId: string; supplierName: string }>,
+  ) => void;
 };
+
+// ---------- matching difuso de proveedor (case/typos → propone, JAMÁS crea) ----------
+
+/** clave laxa: minúsculas y solo alfanumérico ("Bax." → "bax"). */
+export const supplierKey = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function editDistance(a: string, b: string): number {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => {
+    const row = new Array<number>(b.length + 1).fill(0);
+    row[0] = i;
+    return row;
+  });
+  for (let j = 0; j <= b.length; j++) dp[0]![j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i]![j] = Math.min(
+        dp[i - 1]![j]! + 1,
+        dp[i]![j - 1]! + 1,
+        dp[i - 1]![j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+  }
+  return dp[a.length]![b.length]!;
+}
+
+/**
+ * exact (ci) o misma clave alfanumérica → match directo; typo cercano (distancia ≤2 sobre
+ * la clave, o prefijo) → SOLO sugerencia (el que llama pregunta, nunca usa la sugerencia
+ * en silencio ni crea un proveedor nuevo).
+ */
+export function matchSupplier<T extends { name: string }>(
+  list: readonly T[],
+  raw: string,
+): { match: T | null; suggestion: T | null } {
+  const q = raw.trim();
+  if (!q) return { match: null, suggestion: null };
+  const exact = list.find((x) => x.name.toLowerCase() === q.toLowerCase());
+  if (exact) return { match: exact, suggestion: null };
+  const key = supplierKey(q);
+  if (key) {
+    const byKey = list.find((x) => supplierKey(x.name) === key);
+    if (byKey) return { match: byKey, suggestion: null };
+    let best: { item: T; d: number } | null = null;
+    for (const x of list) {
+      const xk = supplierKey(x.name);
+      const d =
+        xk.startsWith(key) || key.startsWith(xk) ? 1 : editDistance(xk, key);
+      if (d <= 2 && (best === null || d < best.d)) best = { item: x, d };
+    }
+    if (best) return { match: null, suggestion: best.item };
+  }
+  return { match: null, suggestion: null };
+}
 
 // ---------- helpers ----------
 
@@ -131,17 +199,19 @@ async function resolveSupplierRef(
 ): Promise<{ ok: true; supplier: AgentSupplier } | { ok: false; error: ToolResult }> {
   if (!raw) return { ok: false, error: { error: "Falta el proveedor." } };
   const suppliers = await deps.listSuppliers();
-  const sp = findByName(suppliers, raw);
-  if (!sp) {
+  const { match, suggestion } = matchSupplier(suppliers, raw);
+  if (!match) {
     return {
       ok: false,
       error: {
         error: `No existe el proveedor "${raw}".`,
+        ...(suggestion !== null ? { quisiste_decir: suggestion.name } : {}),
         proveedores: suppliers.map((s) => s.name),
+        nota: "No se crean proveedores solos: confirmá el nombre o usá create_supplier.",
       },
     };
   }
-  return { ok: true, supplier: sp };
+  return { ok: true, supplier: match };
 }
 
 function buildMatrices(prices: readonly AgentPriceRow[], tiers: readonly AgentTierRow[]) {
@@ -194,6 +264,8 @@ export const EXECUTABLE_TOOLS: ReadonlySet<string> = new Set([
   "analytics_summary",
   "cuentas_summary",
   "best_suppliers",
+  "load_quote",
+  "whatsapp_list",
 ]);
 
 export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolResult> {
@@ -361,6 +433,166 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
       if (!sp.ok) return sp.error;
       await deps.deletePrice({ model_id: ref.modelId, supplier_id: sp.supplier.id });
       return { ok: true, borrado: `${ref.canonical} @ ${sp.supplier.name}` };
+    }
+    case "load_quote": {
+      // La lista pegada EN EL CHAT entra a la MISMA tubería propose-only de la Mesa:
+      // extracción Gemini → resolveModel → checks determinísticos → auto-aplica solo lo
+      // sano (≤±15% vs par, sin flags de sanidad) → candidatos NUEVOS a la cola de
+      // confirmación de la Mesa. La IA jamás crea catálogo.
+      const text = str(args, "text");
+      if (!text) return { error: "Falta 'text' (pegá la lista cruda del proveedor)." };
+      const sp = await resolveSupplierRef(deps, str(args, "supplier"));
+      if (!sp.ok) return sp.error;
+      const items = await deps.extractQuote({ text });
+      if (items.length === 0) {
+        return { error: "La IA no encontró ningún producto con precio en el texto." };
+      }
+      const entries = extractedToQuoteEntries(items);
+      const [repo, models, prices] = await Promise.all([
+        deps.resolver(),
+        deps.listModels(),
+        deps.listPrices(),
+      ]);
+      const nameById = new Map(models.map((m) => [m.id, m.canonical_name]));
+      const minByModel = new Map<string, number>();
+      const pairPrice = new Map<string, number>();
+      for (const p of prices) {
+        const cur = minByModel.get(p.model_id);
+        if (cur === undefined || p.price < cur) minByModel.set(p.model_id, p.price);
+        pairPrice.set(`${p.model_id}:${p.supplier_id}`, p.price);
+      }
+
+      const aplicados: Array<Record<string, unknown>> = [];
+      const aRevisar: Array<Record<string, unknown>> = [];
+      const nuevos: string[] = [];
+      const queued: Array<{
+        entry: QuoteEntry;
+        aliasKey: string;
+        supplierId: string;
+        supplierName: string;
+      }> = [];
+      for (const entry of entries) {
+        const r = resolveModel(entry.rawName, {}, repo);
+        if (!("modelId" in r)) {
+          nuevos.push(entry.rawName);
+          queued.push({
+            entry,
+            aliasKey: r.aliasKey,
+            supplierId: sp.supplier.id,
+            supplierName: sp.supplier.name,
+          });
+          continue;
+        }
+        const modelo = nameById.get(r.modelId) ?? entry.rawName;
+        const flags = checkQuoteEntry(entry, {
+          pairPrice: pairPrice.get(`${r.modelId}:${sp.supplier.id}`) ?? null,
+          modelMin: minByModel.get(r.modelId) ?? null,
+        });
+        if (flags.length > 0) {
+          aRevisar.push({
+            modelo,
+            precio: entry.price,
+            motivos: flags.map((f) => f.motivo),
+            ...(flags.find((f) => f.sugerencia !== undefined)
+              ? { sugerencia: flags.find((f) => f.sugerencia !== undefined)?.sugerencia }
+              : {}),
+          });
+          continue;
+        }
+        await deps.applyQuoteEntry(r.modelId, sp.supplier.id, entry);
+        aplicados.push({
+          modelo,
+          precio: entry.price,
+          ...(entry.tiers.length > 1 ? { escalones: entry.tiers.length } : {}),
+        });
+      }
+      if (queued.length > 0) deps.queueCandidates(queued);
+      return {
+        proveedor: sp.supplier.name,
+        aplicados,
+        a_revisar: aRevisar,
+        nuevos_en_cola: nuevos,
+        nota:
+          `Auto-apliqué solo deltas ≤ ±${PRICE_AUTO_THRESHOLD}% y sin flags de sanidad. ` +
+          (aRevisar.length
+            ? "Los de a_revisar NO se aplicaron: confirmá el precio y usá set_price/set_tiers. "
+            : "") +
+          (nuevos.length
+            ? "Los nuevos quedaron en la COLA DE CONFIRMACIÓN de la Mesa (decile al usuario que los confirme ahí; nada se crea solo)."
+            : ""),
+      };
+    }
+    case "whatsapp_list": {
+      const [models, categories, departments, prices, sales] = await Promise.all([
+        deps.listModels(),
+        deps.listCategories(),
+        deps.listDepartments(),
+        deps.listPrices(),
+        deps.listSalePrices(),
+      ]);
+      const marginPct = num(args, "margin_pct") ?? 3;
+      const deptName = str(args, "department");
+      const catName = str(args, "category");
+      const filter = str(args, "filter").toLowerCase();
+      let deptId: string | null = null;
+      if (deptName) {
+        const dept = findByName(departments, deptName);
+        if (!dept) {
+          return {
+            error: `No existe el departamento "${deptName}".`,
+            departamentos: departments.map((d) => d.name),
+          };
+        }
+        deptId = dept.id;
+      }
+      let catId: string | null = null;
+      if (catName) {
+        const cat = findByName(categories, catName);
+        if (!cat) {
+          return {
+            error: `No existe la categoría "${catName}".`,
+            categorias: categories.map((c) => c.name),
+          };
+        }
+        catId = cat.id;
+      }
+      const minByModel = new Map<string, number>();
+      for (const p of prices) {
+        const cur = minByModel.get(p.model_id);
+        if (cur === undefined || p.price < cur) minByModel.set(p.model_id, p.price);
+      }
+      const saleByModel = new Map(sales.map((sale) => [sale.model_id, sale.price]));
+      const catNameById = new Map(categories.map((c) => [c.id, c.name]));
+      const rows = models
+        .filter((m) => deptId === null || m.department_id === deptId)
+        .filter((m) => catId === null || m.category_id === catId)
+        .filter((m) => filter === "" || m.canonical_name.toLowerCase().includes(filter))
+        .map((m) => {
+          const min = minByModel.get(m.id) ?? null;
+          const price = listaPrice(saleByModel.get(m.id) ?? null, min, min, marginPct);
+          return {
+            categoria: m.category_id ? (catNameById.get(m.category_id) ?? "Otros") : "Otros",
+            name: m.canonical_name,
+            price,
+          };
+        })
+        .filter((r) => r.price !== null); // sin ningún precio no se cotiza
+      const order = [...categories.map((c) => c.name), "Otros"];
+      const groups: WhatsappGroup[] = [];
+      for (const cat of order) {
+        const items = rows.filter((r) => r.categoria === cat);
+        if (items.length && !groups.some((g) => g.category === cat)) {
+          groups.push({ category: cat, items: items.map((r) => ({ name: r.name, price: r.price })) });
+        }
+      }
+      if (groups.length === 0) {
+        return { error: "Ningún modelo con precio matchea ese filtro." };
+      }
+      return {
+        modelos: rows.length,
+        texto_whatsapp: whatsappQuoteText(groups),
+        nota: "Mostrale el texto TAL CUAL al usuario (formato WhatsApp: *categoría* en negrita, precio de Lista o Mín+margen).",
+      };
     }
     // ---------- consulta / briefing ----------
     case "get_mesa_summary": {

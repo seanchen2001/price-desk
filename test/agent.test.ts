@@ -7,8 +7,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { normalize } from "../src/domain/normalize";
 import { clientPulse } from "../src/domain/pulse";
+import { listaPrice, whatsappQuoteText } from "../src/domain/whatsapp";
 import {
   buildExtractionSystem,
+  checkQuoteEntry,
   deltaPct,
   extractedToQuoteEntries,
   EXTRACTION_RESPONSE_SCHEMA,
@@ -20,6 +22,7 @@ import {
 import {
   executeTool,
   EXECUTABLE_TOOLS,
+  matchSupplier,
   type ToolDeps,
 } from "../src/features/agent/executor";
 import { functionCallsOf, generateText, generateTurn, textOf } from "../src/features/agent/gemini";
@@ -199,6 +202,9 @@ function mockDeps(overrides: Partial<ToolDeps> = {}): ToolDeps {
     deletePrice: vi.fn(async () => {}),
     upsertSalePrice: vi.fn(async () => {}),
     deleteSalePrice: vi.fn(async () => {}),
+    extractQuote: vi.fn(async () => []),
+    applyQuoteEntry: vi.fn(async () => {}),
+    queueCandidates: vi.fn(() => {}),
   };
   return { ...base, ...overrides };
 }
@@ -413,6 +419,182 @@ describe("Fase 8 — ejecutor: tools → mutaciones por fila (deps mockeadas)", 
   it("tool desconocida → error visible (no explota)", async () => {
     const r = await executeTool({ name: "hack_the_planet", args: {} }, mockDeps());
     expect(String(r["error"])).toMatch(/desconocida/);
+  });
+});
+
+// ---------- load_quote (lista pegada en el chat → misma tubería propose-only) ----------
+
+describe("Fase 8+ — load_quote desde el chat", () => {
+  const quoteItems = [
+    // sano: delta chico vs par (600→610) y vs mín → auto
+    { rawName: "S26 12+512 5G DS", supplier: "", price: 610, tiers: [] },
+    // sospechoso: 61 ≈ 1/10 del mín del modelo (600) → flag, NO se aplica
+    { rawName: "A17 4+128 DS", supplier: "", price: 6100, tiers: [] },
+    // nuevo: no resuelve → cola de confirmación
+    { rawName: "iPhone 18 Fold 1TB", supplier: "", price: 1500, tiers: [] },
+  ];
+
+  it("aplica lo sano, flaggea lo sospechoso y encola lo nuevo (jamás crea)", async () => {
+    const deps = mockDeps({
+      extractQuote: vi.fn(async () => quoteItems),
+      listPrices: async () => [
+        { model_id: "m1", supplier_id: "s-bax", price: 600, updated_at: new Date().toISOString() },
+        { model_id: "m2", supplier_id: "s-sou", price: 610, updated_at: new Date().toISOString() },
+      ],
+    });
+    const r = await executeTool(
+      { name: "load_quote", args: { supplier: "bax", text: "S26 610\nA17 6100\niPhone 18 Fold 1500" } },
+      deps,
+    );
+    expect(r["proveedor"]).toBe("Bax");
+    const aplicados = r["aplicados"] as Array<Record<string, unknown>>;
+    expect(aplicados).toHaveLength(1);
+    expect(aplicados[0]?.["modelo"]).toBe("S26 12+512 5G DS");
+    expect(deps.applyQuoteEntry).toHaveBeenCalledTimes(1);
+    expect(deps.applyQuoteEntry).toHaveBeenCalledWith(
+      "m1",
+      "s-bax",
+      expect.objectContaining({ price: 610 }),
+    );
+    const aRevisar = r["a_revisar"] as Array<Record<string, unknown>>;
+    expect(aRevisar).toHaveLength(1);
+    expect(aRevisar[0]?.["modelo"]).toBe("A17 4+128 DS");
+    expect(String((aRevisar[0]?.["motivos"] as string[]).join(" "))).toMatch(/unidad/);
+    expect(r["nuevos_en_cola"]).toEqual(["iPhone 18 Fold 1TB"]);
+    expect(deps.queueCandidates).toHaveBeenCalledTimes(1);
+    const queued = (deps.queueCandidates as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0] as Array<Record<string, unknown>>;
+    expect(queued[0]).toMatchObject({ supplierId: "s-bax", supplierName: "Bax" });
+    // guardrail: cero creaciones de catálogo desde la IA
+    expect(deps.createModelWithAlias).not.toHaveBeenCalled();
+  });
+
+  it("proveedor con typo → NO carga, propone el existente (quisiste_decir)", async () => {
+    const deps = mockDeps({ extractQuote: vi.fn(async () => quoteItems) });
+    const r = await executeTool(
+      { name: "load_quote", args: { supplier: "Baxx", text: "S26 610" } },
+      deps,
+    );
+    expect(String(r["error"])).toMatch(/No existe el proveedor/);
+    expect(r["quisiste_decir"]).toBe("Bax");
+    expect(deps.extractQuote).not.toHaveBeenCalled();
+    expect(deps.applyQuoteEntry).not.toHaveBeenCalled();
+  });
+
+  it("case/puntuación del proveedor matchea directo ('bax.' → Bax)", async () => {
+    const deps = mockDeps({
+      extractQuote: vi.fn(async () => [quoteItems[0]!]),
+      listPrices: async () => [],
+    });
+    const r = await executeTool(
+      { name: "load_quote", args: { supplier: "BAX.", text: "S26 610" } },
+      deps,
+    );
+    expect(r["proveedor"]).toBe("Bax");
+    expect(deps.applyQuoteEntry).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Fase 8+ — matchSupplier (difuso, determinístico)", () => {
+  const list = [{ name: "Bax" }, { name: "South Miami" }, { name: "Planet" }];
+  it("exacto ci y clave alfanumérica matchean; typo solo sugiere; lejano nada", () => {
+    expect(matchSupplier(list, "bax").match?.name).toBe("Bax");
+    expect(matchSupplier(list, " south-miami ").match?.name).toBe("South Miami");
+    const typo = matchSupplier(list, "Planett");
+    expect(typo.match).toBeNull();
+    expect(typo.suggestion?.name).toBe("Planet");
+    const nada = matchSupplier(list, "Corvex");
+    expect(nada.match).toBeNull();
+    expect(nada.suggestion).toBeNull();
+  });
+});
+
+// ---------- checks determinísticos de precio ----------
+
+describe("Fase 8+ — checkQuoteEntry (sanidad antes de aplicar)", () => {
+  it("limpio → sin flags (auto-aplicable)", () => {
+    expect(
+      checkQuoteEntry({ price: 610, tiers: [] }, { pairPrice: 600, modelMin: 595 }),
+    ).toEqual([]);
+  });
+  it("error de unidad ~1/10 → flag con sugerencia ×10", () => {
+    const flags = checkQuoteEntry({ price: 61, tiers: [] }, { pairPrice: null, modelMin: 610 });
+    expect(flags).toHaveLength(1);
+    expect(flags[0]?.motivo).toMatch(/unidad/);
+    expect(flags[0]?.sugerencia).toBe(610);
+  });
+  it("error de unidad ~10× → flag con sugerencia ÷10", () => {
+    const flags = checkQuoteEntry({ price: 6100, tiers: [] }, { pairPrice: null, modelMin: 610 });
+    expect(flags[0]?.sugerencia).toBe(610);
+  });
+  it(">30% vs Mín del modelo → flag (sin parecer unidad)", () => {
+    const flags = checkQuoteEntry({ price: 850, tiers: [] }, { pairPrice: null, modelMin: 600 });
+    expect(flags).toHaveLength(1);
+    expect(flags[0]?.motivo).toMatch(/Mín actual del modelo/);
+  });
+  it(">15% vs precio anterior del proveedor → flag (umbral viejo)", () => {
+    const flags = checkQuoteEntry({ price: 720, tiers: [] }, { pairPrice: 600, modelMin: 700 });
+    expect(flags).toHaveLength(1);
+    expect(flags[0]?.motivo).toMatch(/proveedor/);
+  });
+  it("escalera invertida → flag", () => {
+    const flags = checkQuoteEntry(
+      {
+        price: 595,
+        tiers: [
+          { min_qty: 1, price: 595 },
+          { min_qty: 20, price: 620 },
+        ],
+      },
+      { pairPrice: 600, modelMin: 600 },
+    );
+    expect(flags.some((f) => f.motivo.includes("escalera invertida"))).toBe(true);
+  });
+});
+
+// ---------- whatsapp ----------
+
+describe("Fase 8+ — cotización WhatsApp (formato del viejo)", () => {
+  it("categoría en *negrita*, NOMBRE<TAB>$redondeado, grupos con línea en blanco", () => {
+    const txt = whatsappQuoteText([
+      {
+        category: "Samsung Gama Alta",
+        items: [
+          { name: "S26 12+512 5G DS", price: 628.4 },
+          { name: "Z FOLD 7 12+512 5G", price: null },
+        ],
+      },
+      { category: "iPhone Último Modelo", items: [{ name: "iPhone 17 256GB", price: 900 }] },
+      { category: "Vacía", items: [] },
+    ]);
+    expect(txt).toBe(
+      "*Samsung Gama Alta*\nS26 12+512 5G DS\t$628\nZ FOLD 7 12+512 5G\t—\n\n*iPhone Último Modelo*\niPhone 17 256GB\t$900",
+    );
+  });
+  it("listaPrice: manual gana; si no, (min ?? minAny) + margen; nada → null", () => {
+    expect(listaPrice(700, 600, 590, 3)).toBe(700);
+    expect(listaPrice(null, 600, null, 3)).toBe(618);
+    expect(listaPrice(null, null, 590, 3)).toBe(608);
+    expect(listaPrice(null, null, null, 3)).toBeNull();
+  });
+
+  it("tool whatsapp_list: agrupa por categoría con precio Lista/Mín+margen", async () => {
+    const deps = mockDeps({
+      listSalePrices: async () => [{ model_id: "m2", price: 700 }],
+    });
+    const r = await executeTool({ name: "whatsapp_list", args: { department: "Teléfonos" } }, deps);
+    const txt = String(r["texto_whatsapp"]);
+    expect(txt).toContain("*Samsung*");
+    expect(txt).toContain("S26 12+512 5G DS\t$618"); // mín 600 + 3%
+    expect(txt).toContain("A17 4+128 DS\t$700"); // Lista manual
+    expect(r["modelos"]).toBe(2);
+  });
+
+  it("tool whatsapp_list con filter recorta por nombre", async () => {
+    const deps = mockDeps();
+    const r = await executeTool({ name: "whatsapp_list", args: { filter: "S26" } }, deps);
+    expect(String(r["texto_whatsapp"])).toContain("S26");
+    expect(String(r["texto_whatsapp"])).not.toContain("A17");
   });
 });
 

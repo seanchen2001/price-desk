@@ -13,9 +13,9 @@ import { usePrices } from "../../data/prices";
 import { useInsertSupplier, useSuppliers } from "../../data/suppliers";
 import { parseQuoteText } from "../../domain/quoteParser";
 import {
+  checkQuoteEntry,
   extractQuoteAI,
   extractedToQuoteEntries,
-  withinAutoThreshold,
   PRICE_AUTO_THRESHOLD,
 } from "../agent/extraction";
 import type { GeminiImage } from "../agent/gemini";
@@ -26,17 +26,17 @@ import {
   type MatchedEntry,
 } from "./applyQuote";
 import { money } from "./MesaTable";
+import type { PendingCandidate } from "./queueStore";
 import s from "./styles";
 
-export type PendingCandidate = CandidateEntry & {
-  supplierId: string;
-  supplierName: string;
-};
+export type { PendingCandidate } from "./queueStore";
 
 type Preview = {
   matched: MatchedEntry[];
   candidates: CandidateEntry[];
   unparsed: string[];
+  /** motivos de revisión por aliasKey (checks determinísticos del flujo IA) */
+  notes?: Record<string, string[]>;
 };
 
 export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void }) {
@@ -127,8 +127,27 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
       const plan = await planQuote(entries);
       const auto: MatchedEntry[] = [];
       const review: MatchedEntry[] = [];
+      const notes: Record<string, string[]> = {};
+      // Mín actual del MODELO (todos los proveedores) para el sanity-check de unidad/rango
+      const minOfModel = (modelId: string): number | null => {
+        const vals = (prices.data ?? [])
+          .filter((p) => p.model_id === modelId)
+          .map((p) => p.price);
+        return vals.length ? Math.min(...vals) : null;
+      };
       for (const m of plan.matched) {
-        (withinAutoThreshold(currentPrice(m.modelId), m.entry.price) ? auto : review).push(m);
+        const flags = checkQuoteEntry(m.entry, {
+          pairPrice: currentPrice(m.modelId),
+          modelMin: minOfModel(m.modelId),
+        });
+        if (flags.length === 0) {
+          auto.push(m);
+        } else {
+          review.push(m);
+          notes[m.entry.aliasKey] = flags.map(
+            (f) => f.motivo + (f.sugerencia !== undefined ? ` → ¿${money(f.sugerencia)}?` : ""),
+          );
+        }
       }
       if (auto.length > 0) {
         await applyMatched.mutateAsync({ supplierId: selectedSupplier.id, matched: auto });
@@ -148,12 +167,14 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
         err: false,
         text:
           `IA: apliqué ${auto.length} precio(s)` +
-          (review.length ? ` · ${review.length} con delta > ±${PRICE_AUTO_THRESHOLD}% a confirmar abajo` : "") +
+          (review.length
+            ? ` · ${review.length} con FLAG (delta > ±${PRICE_AUTO_THRESHOLD}%, sanidad o escalera) a confirmar abajo`
+            : "") +
           (queued.length ? ` · ${queued.length} nuevo(s) → cola de confirmación` : "") +
           supplierNote,
       });
       if (review.length > 0) {
-        setPreview({ matched: review, candidates: [], unparsed: [] });
+        setPreview({ matched: review, candidates: [], unparsed: [], notes });
       } else {
         setRawText("");
         setImages([]);
@@ -283,12 +304,18 @@ export function PastePanel(props: { onQueue: (items: PendingCandidate[]) => void
             <tbody>
               {preview.matched.map((m) => {
                 const old = currentPrice(m.modelId);
+                const flags = preview.notes?.[m.entry.aliasKey];
                 return (
                   <tr key={m.modelId + m.entry.aliasKey}>
                     <td style={{ ...s.pvTd, ...s.pvName }}>
                       {modelNameById.get(m.modelId) ?? m.entry.rawName}
                       {m.entry.rawName !== (modelNameById.get(m.modelId) ?? "") && (
                         <span style={s.queueMeta}> (visto como “{m.entry.rawName}”)</span>
+                      )}
+                      {flags && flags.length > 0 && (
+                        <div style={{ color: "#f87171", fontSize: 11 }}>
+                          🚩 {flags.join(" · ")}
+                        </div>
                       )}
                     </td>
                     <td style={{ ...s.pvTd, textAlign: "right" }}>

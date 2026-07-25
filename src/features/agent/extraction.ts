@@ -187,6 +187,81 @@ export function extractedToQuoteEntries(items: readonly ExtractedItem[]): QuoteE
   return entries;
 }
 
+// ---------- "inteligencia" determinística al aplicar (la IA solo extrajo texto) ----------
+
+/** Umbral de sanidad vs el Mín actual del MODELO (además del ±15% vs el par). */
+export const PRICE_SANITY_THRESHOLD = 30; // %
+
+export type QuoteFlag = { motivo: string; sugerencia?: number };
+
+/**
+ * Checks previos a aplicar una entrada YA resuelta (Mesa y chat comparten esto):
+ *  - escalera no monótona (más cantidad debería costar ≤) → flag
+ *  - error de unidad probable vs el Mín actual del modelo (~10×/100× en cualquier
+ *    dirección) → flag con precio sugerido
+ *  - delta > ±30% vs el Mín actual del modelo → flag
+ *  - delta > ±15% vs el precio anterior de ESTE proveedor → flag (umbral del viejo)
+ * Sin flags → auto-aplicable. Con flags → revisión humana (jamás se auto-aplica).
+ */
+export function checkQuoteEntry(
+  entry: { price: number; tiers: readonly QuoteTier[] },
+  opts: { pairPrice: number | null; modelMin: number | null },
+): QuoteFlag[] {
+  const flags: QuoteFlag[] = [];
+
+  // escalera invertida
+  for (let i = 1; i < entry.tiers.length; i++) {
+    const prev = entry.tiers[i - 1];
+    const cur = entry.tiers[i];
+    if (prev && cur && cur.price > prev.price) {
+      flags.push({
+        motivo: `escalera invertida: ${cur.min_qty}+ ($${cur.price}) sale MÁS caro que ${prev.min_qty}+ ($${prev.price})`,
+      });
+      break;
+    }
+  }
+
+  const { modelMin, pairPrice } = opts;
+  if (modelMin !== null && modelMin > 0) {
+    const r = entry.price / modelMin;
+    let unitFlag = false;
+    for (const f of [10, 100]) {
+      if (r >= f * 0.8 && r <= f * 1.25) {
+        flags.push({
+          motivo: `posible error de unidad: ~${f}× el Mín actual del modelo ($${modelMin})`,
+          sugerencia: Math.round((entry.price / f) * 100) / 100,
+        });
+        unitFlag = true;
+        break;
+      }
+      if (r >= 0.8 / f && r <= 1.25 / f) {
+        flags.push({
+          motivo: `posible error de unidad: ~1/${f} del Mín actual del modelo ($${modelMin})`,
+          sugerencia: Math.round(entry.price * f * 100) / 100,
+        });
+        unitFlag = true;
+        break;
+      }
+    }
+    if (!unitFlag) {
+      const pct = deltaPct(modelMin, entry.price);
+      if (pct !== null && Math.abs(pct) > PRICE_SANITY_THRESHOLD) {
+        flags.push({
+          motivo: `${pct > 0 ? "+" : ""}${pct.toFixed(0)}% vs el Mín actual del modelo ($${modelMin})`,
+        });
+      }
+    }
+  }
+
+  if (!withinAutoThreshold(pairPrice, entry.price)) {
+    const pct = deltaPct(pairPrice, entry.price);
+    flags.push({
+      motivo: `${pct !== null && pct > 0 ? "+" : ""}${pct?.toFixed(0) ?? "?"}% vs el precio anterior de este proveedor ($${pairPrice})`,
+    });
+  }
+  return flags;
+}
+
 /** % de variación vs el precio actual; null si no hay precio previo (→ auto-aplicable). */
 export function deltaPct(oldPrice: number | null, newPrice: number): number | null {
   if (oldPrice === null || oldPrice === 0) return null;

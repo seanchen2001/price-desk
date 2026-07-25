@@ -25,8 +25,11 @@ import {
 } from "../../data/resolverRepo";
 import { insertSupplier, listSuppliers, updateSupplier } from "../../data/suppliers";
 import { supabase, type Db } from "../../data/supabase";
+import { applyEntry } from "../mesa/applyQuote";
+import { enqueueCandidates } from "../mesa/queueStore";
 import { buildDeskInvoices, buildLedgerEntries } from "../shared/invoiceInputs";
 import type { ToolDeps } from "./executor";
+import { extractQuoteAI } from "./extraction";
 
 export function buildLiveDeps(db: Db = supabase): ToolDeps {
   return {
@@ -83,5 +86,8 @@ export function buildLiveDeps(db: Db = supabase): ToolDeps {
       await upsertSalePrice(row, db);
     },
     deleteSalePrice: (modelId) => deleteSalePrice(modelId, db),
+    extractQuote: (input) => extractQuoteAI(input),
+    applyQuoteEntry: (modelId, supplierId, entry) => applyEntry(modelId, supplierId, entry, db),
+    queueCandidates: (items) => enqueueCandidates(items),
   };
 }

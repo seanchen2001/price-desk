@@ -17,9 +17,11 @@ import {
   useUpsertPrice,
   useUpsertSalePrice,
 } from "../../data/prices";
+import { listaPrice, whatsappQuoteText, type WhatsappGroup } from "../../domain/whatsapp";
 import { ConfirmQueue } from "./ConfirmQueue";
 import { MesaTable } from "./MesaTable";
-import { PastePanel, type PendingCandidate } from "./PastePanel";
+import { PastePanel } from "./PastePanel";
+import { useConfirmQueue } from "./queueStore";
 import s from "./styles";
 import { useMesaData } from "./useMesaData";
 
@@ -110,7 +112,14 @@ export function MesaView() {
   const [marginPct, setMarginPct] = useState(3);
   const [listaPct, setListaPct] = useState(3);
   const [hideEmpty, setHideEmpty] = useState(false);
-  const [queue, setQueue] = useState<PendingCandidate[]>([]);
+  // cola de confirmación compartida (paste + IA + tool load_quote del chat)
+  const queueItems = useConfirmQueue((st) => st.items);
+  const enqueue = useConfirmQueue((st) => st.enqueue);
+  const removeFromQueue = useConfirmQueue((st) => st.remove);
+  // selección para la cotización WhatsApp
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
+  const [waText, setWaText] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   // depto inicial: Teléfonos (cuando llega la lista)
   useEffect(() => {
@@ -156,6 +165,46 @@ export function MesaView() {
     }
   };
 
+  const onToggleRows = (modelIds: readonly string[], on: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of modelIds) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  // texto WhatsApp: formato del viejo (categoría en *negrita*, "NOMBRE<TAB>$precio",
+  // grupos separados por línea en blanco); precio = Lista manual ?? Mín+margen
+  const buildWhatsapp = () => {
+    const groups: WhatsappGroup[] = [];
+    for (const g of data.groups) {
+      const items = g.rows
+        .filter((v) => selectedIds.has(v.row.model.id))
+        .map((v) => ({
+          label: v.label,
+          price: listaPrice(v.row.salePrice, v.row.agg.min, v.row.minAny, marginPct),
+        }))
+        .map((r) => ({ name: r.label, price: r.price }));
+      if (items.length) groups.push({ category: g.category, items });
+    }
+    setCopied(false);
+    setWaText(whatsappQuoteText(groups));
+  };
+
+  const copyWhatsapp = async () => {
+    if (waText === null) return;
+    try {
+      await navigator.clipboard.writeText(waText);
+      setCopied(true);
+    } catch (e) {
+      console.error("clipboard falló:", e);
+      setCopied(false);
+    }
+  };
+
   const totalRows = data.groups.reduce((n, g) => n + g.rows.length, 0);
 
   return (
@@ -178,8 +227,13 @@ export function MesaView() {
         <button style={{ ...s.toolBtn, ...s.toolBtnDisabled }} disabled title="Fase posterior">
           Save snapshot (Fase posterior)
         </button>
-        <button style={{ ...s.toolBtn, ...s.toolBtnDisabled }} disabled title="Fase posterior">
-          Cotización WhatsApp (Fase posterior)
+        <button
+          onClick={buildWhatsapp}
+          disabled={selectedIds.size === 0}
+          style={{ ...s.toolBtn, ...(selectedIds.size === 0 ? s.toolBtnDisabled : {}) }}
+          title="Marcá modelos con los checkbox de la grilla (o por categoría) y generá el texto"
+        >
+          Cotización WhatsApp ({selectedIds.size})
         </button>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12 }}>
           Client +
@@ -222,11 +276,37 @@ export function MesaView() {
         <span style={s.toolNote}>los precios expiran cada lunes</span>
       </div>
 
-      <PastePanel onQueue={(items) => setQueue((q) => [...q, ...items])} />
+      {waText !== null && (
+        <section style={s.section}>
+          <div style={s.sectionTitle}>
+            Cotización WhatsApp — {selectedIds.size} modelo(s) · Lista (o Mín +{marginPct}%)
+          </div>
+          <textarea readOnly value={waText} rows={Math.min(14, waText.split("\n").length + 1)} style={{ ...s.textarea, width: "100%" }} />
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <button onClick={() => void copyWhatsapp()} style={s.primaryBtn}>
+              {copied ? "¡Copiado!" : "Copiar para WhatsApp"}
+            </button>
+            <button
+              onClick={() => {
+                setSelectedIds(new Set());
+                setWaText(null);
+              }}
+              style={{ ...s.toolBtn, ...s.toolBtnGhost }}
+            >
+              Limpiar selección
+            </button>
+            <button onClick={() => setWaText(null)} style={{ ...s.toolBtn, ...s.toolBtnGhost }}>
+              Cerrar
+            </button>
+          </div>
+        </section>
+      )}
+
+      <PastePanel onQueue={enqueue} />
       <ConfirmQueue
-        items={queue}
+        items={queueItems}
         defaultDepartmentId={selectedDeptId}
-        onDone={(aliasKey) => setQueue((q) => q.filter((i) => i.aliasKey !== aliasKey))}
+        onDone={removeFromQueue}
       />
       <CategoriesPanel />
 
@@ -248,6 +328,8 @@ export function MesaView() {
             onSetPrice={onSetPrice}
             onSetLista={onSetLista}
             onSetCategory={onSetCategory}
+            selectedIds={selectedIds}
+            onToggleRows={onToggleRows}
           />
         )}
       </section>

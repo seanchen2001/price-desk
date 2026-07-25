@@ -1,11 +1,61 @@
 // La grilla de la Mesa: modelo × proveedor con edición inline, coloreo por frescura
 // (recién/actualizado/expirado + mejor precio + outlier), Mín/Medio/Lista/Cliente.
 // Paridad visual con el MesaView viejo (misma información y semántica de color).
-import { useState, type CSSProperties, type JSX } from "react";
+import { useState, type CSSProperties, type JSX, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import type { CategoryRow } from "../../data/departments";
 import type { SupplierRow } from "../../data/suppliers";
 import s from "./styles";
+import { useMesaUi } from "./uiStore";
 import type { MesaCategoryGroup, MesaVisualRow } from "./useMesaData";
+
+// anchos default por columna (px) — ajustables con drag en el borde del header,
+// persistidos por columna en localStorage (uiStore)
+const DEFAULT_W: Record<string, number> = { sku: 250, min: 80, med: 95, lista: 90, client: 100 };
+const SUPPLIER_W = 112;
+
+/** th con manija de resize en el borde derecho (drag → ancho persistido). */
+function ResizableTh(props: {
+  colKey: string;
+  defaultW: number;
+  style?: CSSProperties;
+  children?: ReactNode;
+}) {
+  const width = useMesaUi((st) => st.colWidths[props.colKey]) ?? props.defaultW;
+  const setColWidth = useMesaUi((st) => st.setColWidth);
+  const onDown = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = width;
+    const move = (ev: globalThis.MouseEvent) =>
+      setColWidth(props.colKey, startW + (ev.clientX - startX));
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+  return (
+    <th style={{ ...s.th, ...props.style, width, position: "relative" }}>
+      {props.children}
+      <span
+        onMouseDown={onDown}
+        title="Arrastrá para ajustar el ancho"
+        style={{
+          position: "absolute",
+          right: -3,
+          top: 0,
+          bottom: 0,
+          width: 7,
+          cursor: "col-resize",
+          userSelect: "none",
+          zIndex: 2,
+        }}
+      />
+    </th>
+  );
+}
 
 export const money = (n: number | null | undefined): string =>
   typeof n === "number" ? "$" + Math.round(n).toLocaleString("en-US") : "—";
@@ -56,10 +106,31 @@ export function MesaTable(props: {
   onSetPrice: (modelId: string, supplierId: string, price: number | null) => void;
   onSetLista: (modelId: string, price: number | null) => void;
   onSetCategory: (modelId: string, categoryId: string | null) => void;
+  /** selección para la cotización WhatsApp (checkbox por fila / por categoría) */
+  selectedIds: ReadonlySet<string>;
+  onToggleRows: (modelIds: readonly string[], on: boolean) => void;
 }) {
-  const { groups, deptSuppliers, categories, marginPct, onSetPrice, onSetLista, onSetCategory } =
-    props;
+  const {
+    groups,
+    deptSuppliers,
+    categories,
+    marginPct,
+    onSetPrice,
+    onSetLista,
+    onSetCategory,
+    selectedIds,
+    onToggleRows,
+  } = props;
   const colSpanAll = deptSuppliers.length + 5;
+  const colWidths = useMesaUi((st) => st.colWidths);
+  const wOf = (key: string, def: number) => colWidths[key] ?? def;
+  const tableWidth =
+    wOf("sku", DEFAULT_W["sku"]!) +
+    deptSuppliers.reduce((n, sp) => n + wOf(`sp:${sp.id}`, SUPPLIER_W), 0) +
+    wOf("min", DEFAULT_W["min"]!) +
+    wOf("med", DEFAULT_W["med"]!) +
+    wOf("lista", DEFAULT_W["lista"]!) +
+    wOf("client", DEFAULT_W["client"]!);
 
   const renderRow = (v: MesaVisualRow) => {
     const row = v.row;
@@ -69,7 +140,14 @@ export function MesaTable(props: {
     const listaAuto = agg.min !== null ? Math.round(agg.min * (1 + marginPct / 100)) : null;
     return (
       <tr key={model.id}>
-        <td style={{ ...s.td, ...s.tdSku }}>
+        <td style={{ ...s.td, ...s.tdSku, overflow: "hidden", textOverflow: "ellipsis" }}>
+          <input
+            type="checkbox"
+            checked={selectedIds.has(model.id)}
+            onChange={(e) => onToggleRows([model.id], e.target.checked)}
+            style={{ ...s.chk, marginRight: 6, verticalAlign: "middle" }}
+            title="Marcar para la cotización WhatsApp"
+          />
           {v.label}
           {v.collapsed.length > 0 && (
             <span
@@ -234,24 +312,41 @@ export function MesaTable(props: {
   return (
     <>
       <div style={s.tableWrap}>
-        <table style={s.table}>
+        <table style={{ ...s.table, tableLayout: "fixed", width: tableWidth, minWidth: 0 }}>
           <thead>
             <tr>
-              <th style={{ ...s.th, ...s.thSku }}>SKU</th>
+              <ResizableTh colKey="sku" defaultW={DEFAULT_W["sku"]!} style={s.thSku}>
+                SKU
+              </ResizableTh>
               {deptSuppliers.map((sp) => (
-                <th key={sp.id} style={s.th}>
+                <ResizableTh key={sp.id} colKey={`sp:${sp.id}`} defaultW={SUPPLIER_W}>
                   {sp.name}
-                </th>
+                </ResizableTh>
               ))}
-              <th style={s.th}>Minimo</th>
-              <th style={s.th}>Medio</th>
-              <th style={s.th}>Lista</th>
-              <th style={{ ...s.th, ...s.thMine }}>Client {marginPct}%</th>
+              <ResizableTh colKey="min" defaultW={DEFAULT_W["min"]!}>
+                Minimo
+              </ResizableTh>
+              <ResizableTh colKey="med" defaultW={DEFAULT_W["med"]!}>
+                Medio
+              </ResizableTh>
+              <ResizableTh colKey="lista" defaultW={DEFAULT_W["lista"]!}>
+                Lista
+              </ResizableTh>
+              <ResizableTh colKey="client" defaultW={DEFAULT_W["client"]!} style={s.thMine}>
+                {`Client ${marginPct}%`}
+              </ResizableTh>
             </tr>
           </thead>
           <tbody>
             {groups.map((g) => (
-              <FragmentGroup key={g.category} colSpan={colSpanAll} group={g} render={renderRow} />
+              <FragmentGroup
+                key={g.category}
+                colSpan={colSpanAll}
+                group={g}
+                render={renderRow}
+                selectedIds={selectedIds}
+                onToggleRows={onToggleRows}
+              />
             ))}
           </tbody>
         </table>
@@ -294,15 +389,36 @@ function FragmentGroup(props: {
   group: MesaCategoryGroup;
   colSpan: number;
   render: (row: MesaVisualRow) => JSX.Element;
+  selectedIds: ReadonlySet<string>;
+  onToggleRows: (modelIds: readonly string[], on: boolean) => void;
 }) {
+  // secciones COLAPSABLES: click en el header pliega/despliega (persistido en localStorage)
+  const collapsed = useMesaUi((st) => st.collapsedCats[props.group.category] === true);
+  const toggleCat = useMesaUi((st) => st.toggleCat);
+  const ids = props.group.rows.map((v) => v.row.model.id);
+  const allSelected = ids.length > 0 && ids.every((id) => props.selectedIds.has(id));
   return (
     <>
       <tr>
-        <td colSpan={props.colSpan} style={s.catRow}>
-          {props.group.category}
+        <td
+          colSpan={props.colSpan}
+          style={{ ...s.catRow, cursor: "pointer", userSelect: "none" }}
+          onClick={() => toggleCat(props.group.category)}
+          title="Click: plegar/desplegar la sección"
+        >
+          <input
+            type="checkbox"
+            checked={allSelected}
+            onChange={(e) => props.onToggleRows(ids, e.target.checked)}
+            onClick={(e) => e.stopPropagation()}
+            style={{ ...s.chk, marginRight: 6, verticalAlign: "middle" }}
+            title="Marcar toda la categoría para la cotización WhatsApp"
+          />
+          {collapsed ? "▸" : "▾"} {props.group.category}
+          <span style={{ color: "#5b657a", fontWeight: 400 }}> ({props.group.rows.length})</span>
         </td>
       </tr>
-      {props.group.rows.map(props.render)}
+      {!collapsed && props.group.rows.map(props.render)}
     </>
   );
 }
