@@ -285,6 +285,32 @@ const DECLARATIONS: Declaration[] = [
       },
     },
   },
+  {
+    name: "get_agent_runs",
+    description:
+      "Lista las corridas del agente AUTÓNOMO (journal agent_runs): qué encontró, qué hizo (o habría hecho en sombra), reporte y veredicto humano. Usala cuando pregunten '¿qué hizo el agente solo?' o para revisar una corrida antes del veredicto.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        task: STR("Filtrar por tarea (ej. 'qa'). Opcional."),
+        limit: { type: "INTEGER", description: "Máx corridas (default 20)." },
+      },
+    },
+  },
+  {
+    name: "review_agent_run",
+    description:
+      "Guarda el VEREDICTO HUMANO sobre una corrida autónoma ('aprobado'|'rechazado' + notas) — alimenta las métricas de promoción de la escalera de confianza. SOLO cuando el usuario da el veredicto explícito; jamás lo inventes vos.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        id: STR("Id de la corrida (de get_agent_runs)."),
+        verdict: STR("'aprobado' o 'rechazado' (palabras del usuario)."),
+        notas: STR("Notas del usuario (opcional)."),
+      },
+      required: ["id", "verdict"],
+    },
+  },
   // ---------- consulta / briefing ----------
   {
     name: "get_mesa_summary",
@@ -360,6 +386,7 @@ export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   "delete_price",
   "apply_lines",
   "remember",
+  "review_agent_run",
 ]);
 
 export type AgentSystemContext = {

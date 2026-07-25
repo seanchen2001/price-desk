@@ -5,6 +5,47 @@ export type Json = string | number | boolean | null | { [key: string]: Json | un
 export interface Database {
   public: {
     Tables: {
+      // agent_runs: agregado A MANO (0005 pendiente de aplicar en el SQL editor);
+      // al regenerar tipos DESPUÉS de aplicar la migración, este bloque sale igual.
+      agent_runs: {
+        Row: {
+          id: string;
+          ts: string;
+          task: string;
+          mode: string;
+          status: string;
+          findings: Json | null;
+          actions: Json | null;
+          report: string | null;
+          metrics: Json | null;
+          review: Json | null;
+        };
+        Insert: {
+          id?: string;
+          ts?: string;
+          task: string;
+          mode: string;
+          status?: string;
+          findings?: Json | null;
+          actions?: Json | null;
+          report?: string | null;
+          metrics?: Json | null;
+          review?: Json | null;
+        };
+        Update: {
+          id?: string;
+          ts?: string;
+          task?: string;
+          mode?: string;
+          status?: string;
+          findings?: Json | null;
+          actions?: Json | null;
+          report?: string | null;
+          metrics?: Json | null;
+          review?: Json | null;
+        };
+        Relationships: [];
+      };
       categories: {
         Row: {
           id: string;

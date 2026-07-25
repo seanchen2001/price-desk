@@ -117,6 +117,23 @@ export type ToolDeps = {
   // memoria del negociador (tabla knowledge)
   listKnowledge: () => Promise<Array<{ id: string; rule_text: string }>>;
   insertKnowledge: (ruleText: string) => Promise<void>;
+  // journal de corridas del agente autónomo (P2 — tabla agent_runs, migración 0005)
+  listAgentRuns: (opts: { task?: string; limit?: number }) => Promise<AgentRunSummary[]>;
+  reviewAgentRun: (
+    id: string,
+    review: { verdict: "aprobado" | "rechazado"; notas?: string },
+  ) => Promise<void>;
+};
+
+export type AgentRunSummary = {
+  id: string;
+  ts: string;
+  task: string;
+  mode: string;
+  status: string;
+  report: string | null;
+  metrics: unknown;
+  review: unknown;
 };
 
 // ---------- matching difuso de proveedor (case/typos → propone, JAMÁS crea) ----------
@@ -373,6 +390,8 @@ export const EXECUTABLE_TOOLS: ReadonlySet<string> = new Set([
   "remember",
   "recall",
   "whatsapp_list",
+  "get_agent_runs",
+  "review_agent_run",
 ]);
 
 export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolResult> {
@@ -1042,6 +1061,52 @@ export async function executeTool(call: ToolCall, deps: ToolDeps): Promise<ToolR
         notas,
         total_memoria: rules.length,
       };
+    }
+    case "get_agent_runs": {
+      const task = str(args, "task");
+      const limitRaw = num(args, "limit");
+      try {
+        const rows = await deps.listAgentRuns({
+          ...(task !== "" ? { task } : {}),
+          ...(limitRaw !== null ? { limit: Math.max(1, Math.round(limitRaw)) } : {}),
+        });
+        if (rows.length === 0) return { corridas: [], nota: "Sin corridas registradas todavía." };
+        return {
+          corridas: rows.map((r) => ({
+            id: r.id,
+            ts: r.ts,
+            task: r.task,
+            mode: r.mode,
+            status: r.status,
+            review: r.review ?? "sin revisar",
+            metrics: r.metrics,
+            reporte: typeof r.report === "string" ? r.report.slice(0, 800) : null,
+          })),
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          error:
+            msg +
+            (/agent_runs/.test(msg)
+              ? " — la tabla agent_runs no existe todavía: correr supabase/migrations/0005_agent_runs.sql en el SQL editor."
+              : ""),
+        };
+      }
+    }
+    case "review_agent_run": {
+      const id = str(args, "id");
+      const verdict = str(args, "verdict");
+      if (!id) return { error: "Falta 'id' de la corrida (véase get_agent_runs)." };
+      if (verdict !== "aprobado" && verdict !== "rechazado") {
+        return { error: "verdict debe ser 'aprobado' o 'rechazado' (el veredicto es del USUARIO: pedíselo)." };
+      }
+      const notas = str(args, "notas");
+      await deps.reviewAgentRun(id, {
+        verdict,
+        ...(notas !== "" ? { notas } : {}),
+      });
+      return { ok: true, id, verdict, nota: "Veredicto guardado — alimenta las métricas de promoción de la escalera." };
     }
     case "whatsapp_list": {
       const [models, categories, departments, prices, sales] = await Promise.all([

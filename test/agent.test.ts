@@ -37,6 +37,12 @@ import {
   matchSupplier,
   type ToolDeps,
 } from "../src/features/agent/executor";
+import {
+  DEFAULT_LIMITS,
+  wrapDepsWithPolicy,
+  type AgentPolicy,
+  type PolicyEvent,
+} from "../src/features/agent/policy";
 import { functionCallsOf, generateText, generateTurn, textOf } from "../src/features/agent/gemini";
 import {
   AGENT_TOOLS,
@@ -279,9 +285,25 @@ function mockDeps(overrides: Partial<ToolDeps> = {}, seed?: MockSeed): ToolDeps 
     insertKnowledge: vi.fn(async (t: string) => {
       knowledgeRows.push({ id: String(knowledgeRows.length + 1), rule_text: t });
     }),
+    listAgentRuns: async () => agentRunRows.map((r) => ({ ...r })),
+    reviewAgentRun: vi.fn(async (id: string, review: { verdict: string; notas?: string }) => {
+      const row = agentRunRows.find((r) => r.id === id);
+      if (row) row.review = review;
+    }),
   };
   return { ...base, ...overrides };
 }
+
+let agentRunRows: Array<{
+  id: string;
+  ts: string;
+  task: string;
+  mode: string;
+  status: string;
+  report: string | null;
+  metrics: unknown;
+  review: unknown;
+}> = [];
 
 // staging en memoria (mismo contrato que el store zustand real)
 function stagingMock() {
@@ -1156,6 +1178,179 @@ describe("Gate P1 — apply_lines gatea POR LÍNEA (recalculado contra la Mesa a
     expect((r["bloqueadas"] as unknown[]).length).toBe(1);
     expect(deps.applyQuoteEntry).not.toHaveBeenCalled();
     expect(deps.getStaged()?.lines).toHaveLength(2);
+  });
+});
+
+// ---------- P2: política de autonomía (escalera de confianza) ----------
+
+function policyOf(mode: AgentPolicy["mode"], limits = DEFAULT_LIMITS): AgentPolicy {
+  return { task: "qa", mode, limits };
+}
+
+describe("Política P2 — modo SOMBRA (recorder + overlay)", () => {
+  it("las mutaciones NO tocan la base, quedan en el journal y el overlay las refleja", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(deps, policyOf("shadow"), (e) => journal.push(e));
+    await wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-bax", price: 630 });
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+    expect(journal.map((e) => e.kind)).toEqual(["registrado"]);
+    // overlay: la lectura releída refleja el estado "como-si"
+    const after = (await wrapped.listPrices()).find(
+      (r) => r.model_id === "m1" && r.supplier_id === "s-bax",
+    );
+    expect(after?.price).toBe(630);
+    // la base REAL sigue intacta
+    const real = (await deps.listPrices()).find(
+      (r) => r.model_id === "m1" && r.supplier_id === "s-bax",
+    );
+    expect(real?.price).toBe(600);
+  });
+
+  it("set_price completo vía executor en sombra: ok + verificacion coherente, cero writes reales", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(deps, policyOf("shadow"), (e) => journal.push(e));
+    const r = await executeTool(
+      { name: "set_price", args: { model: "S26 12+512 5G DS", supplier: "Bax", price: 630 } },
+      wrapped,
+    );
+    expect(r["ok"]).toBe(true);
+    expect((r["verificacion"] as { coincide: boolean }).coincide).toBe(true); // overlay
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+    expect(deps.appendPriceHistory).not.toHaveBeenCalled();
+    expect(journal.filter((e) => e.kind === "registrado").map((e) => e.dep)).toEqual([
+      "upsertPrice",
+      "appendPriceHistory",
+    ]);
+  });
+
+  it("el gate sigue mandando en sombra: precio insano → bloqueado (ni registro de escritura)", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(deps, policyOf("shadow"), (e) => journal.push(e));
+    const r = await executeTool(
+      { name: "set_price", args: { model: "S26 12+512 5G DS", supplier: "Bax", price: 61 } },
+      wrapped,
+    );
+    expect(r["bloqueado"]).toBe(true);
+    expect(journal).toHaveLength(0);
+  });
+
+  it("confirmables (deletePrice) en sombra: solo registro", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(deps, policyOf("shadow"), (e) => journal.push(e));
+    await wrapped.deletePrice({ model_id: "m1", supplier_id: "s-bax" });
+    expect(deps.deletePrice).not.toHaveBeenCalled();
+    expect(journal[0]?.dep).toBe("deletePrice");
+    expect(journal[0]?.kind).toBe("registrado");
+  });
+});
+
+describe("Política P2 — modo AUTO_LIMITED (límites antes de delegar)", () => {
+  it("dentro de límites → ejecuta y journalea 'ejecutado'", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(deps, policyOf("auto_limited"), (e) => journal.push(e));
+    await wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-bax", price: 630 }); // +5%
+    expect(deps.upsertPrice).toHaveBeenCalledTimes(1);
+    expect(journal.some((e) => e.kind === "ejecutado" && e.dep === "upsertPrice")).toBe(true);
+  });
+
+  it("delta > maxDeltaPct → denegado_por_politica (throw ruidoso, cero writes)", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(deps, policyOf("auto_limited"), (e) => journal.push(e));
+    await expect(
+      wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-bax", price: 720 }), // +20%
+    ).rejects.toThrow(/denegado_por_politica/);
+    expect(deps.upsertPrice).not.toHaveBeenCalled();
+    expect(journal[0]?.kind).toBe("denegado_por_politica");
+    expect(String(journal[0]?.detalle["motivo"])).toMatch(/maxDeltaPct/);
+  });
+
+  it("maxLines por corrida: la línea N+1 se deniega", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const wrapped = wrapDepsWithPolicy(
+      deps,
+      policyOf("auto_limited", { ...DEFAULT_LIMITS, maxLines: 2 }),
+      (e) => journal.push(e),
+    );
+    await wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-bax", price: 605 });
+    await wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-sou", price: 645 });
+    await expect(
+      wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-bax", price: 606 }),
+    ).rejects.toThrow(/maxLines/);
+    expect(deps.upsertPrice).toHaveBeenCalledTimes(2);
+  });
+
+  it("impacto acumulado > maxTotalImpactUsd → denegado", async () => {
+    const deps = mockDeps();
+    const wrapped = wrapDepsWithPolicy(
+      deps,
+      policyOf("auto_limited", { ...DEFAULT_LIMITS, maxTotalImpactUsd: 30 }),
+      () => {},
+    );
+    await wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-bax", price: 620 }); // impacto 20
+    await expect(
+      wrapped.upsertPrice({ model_id: "m1", supplier_id: "s-sou", price: 660 }), // +20 → 40 > 30
+    ).rejects.toThrow(/maxTotalImpactUsd/);
+  });
+
+  it("confirmables en limitado: solo registro; en FULL ejecutan", async () => {
+    const deps = mockDeps();
+    const journal: PolicyEvent[] = [];
+    const limited = wrapDepsWithPolicy(deps, policyOf("auto_limited"), (e) => journal.push(e));
+    await limited.deletePrice({ model_id: "m1", supplier_id: "s-bax" });
+    expect(deps.deletePrice).not.toHaveBeenCalled();
+    expect(journal.at(-1)?.kind).toBe("registrado");
+    const full = wrapDepsWithPolicy(deps, policyOf("full"), (e) => journal.push(e));
+    await full.deletePrice({ model_id: "m1", supplier_id: "s-bax" });
+    expect(deps.deletePrice).toHaveBeenCalledTimes(1);
+    expect(journal.at(-1)?.kind).toBe("ejecutado");
+  });
+});
+
+describe("P2 — tools del journal (get_agent_runs / review_agent_run)", () => {
+  it("get_agent_runs lista corridas con reporte y review", async () => {
+    agentRunRows = [
+      {
+        id: "run1",
+        ts: "2026-07-25T10:00:00Z",
+        task: "qa",
+        mode: "shadow",
+        status: "ok",
+        report: "3 hallazgos: 2 stale, 1 escalera invertida",
+        metrics: { findings: 3 },
+        review: null,
+      },
+    ];
+    const deps = mockDeps();
+    const r = await executeTool({ name: "get_agent_runs", args: { task: "qa" } }, deps);
+    const corridas = r["corridas"] as Array<Record<string, unknown>>;
+    expect(corridas).toHaveLength(1);
+    expect(corridas[0]?.["review"]).toBe("sin revisar");
+    expect(String(corridas[0]?.["reporte"])).toMatch(/escalera invertida/);
+  });
+
+  it("review_agent_run valida el verdict y lo guarda; sin corridas → nota", async () => {
+    agentRunRows = [
+      { id: "run1", ts: "t", task: "qa", mode: "shadow", status: "ok", report: null, metrics: null, review: null },
+    ];
+    const deps = mockDeps();
+    const bad = await executeTool({ name: "review_agent_run", args: { id: "run1", verdict: "maso" } }, deps);
+    expect(String(bad["error"])).toMatch(/aprobado.*rechazado/);
+    const ok = await executeTool(
+      { name: "review_agent_run", args: { id: "run1", verdict: "aprobado", notas: "buen QA" } },
+      deps,
+    );
+    expect(ok["ok"]).toBe(true);
+    expect(deps.reviewAgentRun).toHaveBeenCalledWith("run1", { verdict: "aprobado", notas: "buen QA" });
+    agentRunRows = [];
+    const empty = await executeTool({ name: "get_agent_runs", args: {} }, deps);
+    expect(String(empty["nota"])).toMatch(/Sin corridas/);
   });
 });
 

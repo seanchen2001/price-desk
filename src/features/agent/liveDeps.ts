@@ -1,6 +1,7 @@
 // ToolDeps REALES del ejecutor: cableado 1:1 a la capa de datos existente (mutaciones
 // por fila + resolvedor canónico). Separado de executor.ts para que los unit tests
 // (que mockean deps) no importen supabase en runtime.
+import { listAgentRuns, reviewAgentRun } from "../../data/agentRuns";
 import { listClients } from "../../data/clients";
 import { insertCategory, listCategories, listDepartments, renameCategory } from "../../data/departments";
 import { listInvoiceItems, listInvoices } from "../../data/invoices";
@@ -102,6 +103,10 @@ export function buildLiveDeps(db: Db = supabase): ToolDeps {
     listKnowledge: () => listKnowledge(db),
     insertKnowledge: async (ruleText) => {
       await insertKnowledge(ruleText, db);
+    },
+    listAgentRuns: (opts) => listAgentRuns(opts, db),
+    reviewAgentRun: async (id, review) => {
+      await reviewAgentRun(id, review, db);
     },
   };
 }
