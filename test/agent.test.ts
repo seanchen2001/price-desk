@@ -223,12 +223,18 @@ describe("Fase 8 — declaraciones de tools", () => {
       suppliers: ["Bax", "South"],
       modelCount: 42,
       knowledge: ["Los iPhone van al depto iPhone"],
+      activeTab: "Órdenes",
     });
     expect(sys).toContain("Samsung Gama Alta");
     expect(sys).toContain("Bax, South");
     expect(sys).toContain("42");
     expect(sys).toContain("Los iPhone van al depto iPhone");
+    expect(sys).toContain('tab "Órdenes"'); // contexto del panel lateral (tab activo)
     expect(sys).toMatch(/resolvedor/);
+    // sin activeTab no se inyecta la línea de contexto
+    expect(
+      buildAgentSystem({ departments: [], categories: [], suppliers: [], modelCount: 0 }),
+    ).not.toContain("mirando el tab");
     expect(AGENT_TOOLS[0]?.function_declarations.length).toBe(TOOL_NAMES.size);
   });
 });

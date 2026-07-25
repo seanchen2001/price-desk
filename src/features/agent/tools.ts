@@ -231,6 +231,8 @@ export type AgentSystemContext = {
   suppliers: readonly string[];
   modelCount: number;
   knowledge?: readonly string[];
+  /** tab activo de la app ("Mesa", "Órdenes", …) — desambigua comandos vagos */
+  activeTab?: string;
 };
 
 /** System prompt del agente — dinámico (catálogos reales) y propose-only. */
@@ -249,6 +251,9 @@ export function buildAgentSystem(ctx: AgentSystemContext): string {
     `- Categorías: ${ctx.categories.join(", ") || "(ninguna)"}.`,
     `- Proveedores: ${ctx.suppliers.join(", ") || "(ninguno)"}.`,
     `- Modelos en catálogo: ${ctx.modelCount}.`,
+    ctx.activeTab !== undefined && ctx.activeTab !== ""
+      ? `- El usuario está mirando el tab "${ctx.activeTab}" ahora mismo: interpretá los pedidos ambiguos en ese contexto (ej. "esta tabla"/"acá" = ese tab).`
+      : "",
     ctx.knowledge && ctx.knowledge.length
       ? "REGLAS APRENDIDAS (respetalas):\n" + ctx.knowledge.map((r) => `  • ${r}`).join("\n")
       : "",

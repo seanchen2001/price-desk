@@ -1,12 +1,14 @@
-// Shell Fase 7: router de tabs (Mesa | Órdenes | Historial | Clientes | Cuentas | PnL |
-// Analítica; Mesa default). Errores de datos SIEMPRE visibles (hub central → toast).
+// Shell Fase 8: router de tabs (Mesa | Órdenes | Historial | Clientes | Cuentas | PnL |
+// Analítica; Mesa default) + panel LATERAL del agente (AgentPanel), colapsable y
+// disponible desde TODOS los tabs — paridad con el ChatBox del viejo; la vista principal
+// se encoge por flex cuando está abierto. Errores de datos SIEMPRE visibles (toast).
 // El seed idempotente de departments/categories corre al boot (src/data/departments.ts).
 // Cross-tab: "Editar" en Historial abre Órdenes en modo edición; el checkpoint de
 // IMEIs del timeline de Órdenes abre el editor de IMEIs en Historial.
 import { useEffect, useState } from "react";
 import { errorMessage, setDataErrorHandler } from "../data/errors";
 import { useEnsureCatalogSeed } from "../data/departments";
-import { AgentView } from "../features/agent/AgentView";
+import { AgentPanel } from "../features/agent/AgentView";
 import { AnaliticaView } from "../features/analitica/AnaliticaView";
 import { ClientesView } from "../features/clientes/ClientesView";
 import { CuentasView } from "../features/cuentas/CuentasView";
@@ -16,15 +18,7 @@ import { OrdenesView } from "../features/ordenes/OrdenesView";
 import { PnLView } from "../features/pnl/PnLView";
 import s from "../features/mesa/styles";
 
-type Tab =
-  | "mesa"
-  | "ordenes"
-  | "historial"
-  | "clientes"
-  | "cuentas"
-  | "pnl"
-  | "analitica"
-  | "agente";
+type Tab = "mesa" | "ordenes" | "historial" | "clientes" | "cuentas" | "pnl" | "analitica";
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: "mesa", label: "Mesa" },
@@ -34,7 +28,6 @@ const TABS: Array<{ id: Tab; label: string }> = [
   { id: "cuentas", label: "Cuentas" },
   { id: "pnl", label: "PnL" },
   { id: "analitica", label: "Analítica" },
-  { id: "agente", label: "Agente" },
 ];
 
 export function App() {
@@ -57,7 +50,7 @@ export function App() {
     <main style={s.page}>
       <div style={s.header}>
         <h1 style={s.h1}>PRICE DESK</h1>
-        <span style={s.sub}>v2 · Fase 8 — Mesa · Órdenes · Historial · Clientes · Cuentas · PnL · Analítica · Agente</span>
+        <span style={s.sub}>v2 · Fase 8 — Mesa · Órdenes · Historial · Clientes · Cuentas · PnL · Analítica + agente lateral</span>
         <span style={{ display: "inline-flex", gap: 6, marginLeft: 16 }}>
           {TABS.map((t) => (
             <button
@@ -100,35 +93,40 @@ export function App() {
         </div>
       )}
 
-      {tab === "mesa" && <MesaView />}
-      {tab === "ordenes" && (
-        <OrdenesView
-          editInvoiceId={editInvoiceId}
-          onDoneEditing={() => {
-            setEditInvoiceId(null);
-            setTab("historial");
-          }}
-          onLoadImeis={(invoiceId) => {
-            setImeiInvoiceId(invoiceId);
-            setTab("historial");
-          }}
-        />
-      )}
-      {tab === "historial" && (
-        <HistorialView
-          onEdit={(invoiceId) => {
-            setEditInvoiceId(invoiceId);
-            setTab("ordenes");
-          }}
-          autoImeiInvoiceId={imeiInvoiceId}
-          onAutoImeiHandled={() => setImeiInvoiceId(null)}
-        />
-      )}
-      {tab === "clientes" && <ClientesView />}
-      {tab === "cuentas" && <CuentasView />}
-      {tab === "pnl" && <PnLView />}
-      {tab === "analitica" && <AnaliticaView />}
-      {tab === "agente" && <AgentView />}
+      {/* vista principal + panel lateral del agente (flex: la vista se encoge) */}
+      <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {tab === "mesa" && <MesaView />}
+          {tab === "ordenes" && (
+            <OrdenesView
+              editInvoiceId={editInvoiceId}
+              onDoneEditing={() => {
+                setEditInvoiceId(null);
+                setTab("historial");
+              }}
+              onLoadImeis={(invoiceId) => {
+                setImeiInvoiceId(invoiceId);
+                setTab("historial");
+              }}
+            />
+          )}
+          {tab === "historial" && (
+            <HistorialView
+              onEdit={(invoiceId) => {
+                setEditInvoiceId(invoiceId);
+                setTab("ordenes");
+              }}
+              autoImeiInvoiceId={imeiInvoiceId}
+              onAutoImeiHandled={() => setImeiInvoiceId(null)}
+            />
+          )}
+          {tab === "clientes" && <ClientesView />}
+          {tab === "cuentas" && <CuentasView />}
+          {tab === "pnl" && <PnLView />}
+          {tab === "analitica" && <AnaliticaView />}
+        </div>
+        <AgentPanel activeTabLabel={TABS.find((t) => t.id === tab)?.label ?? tab} />
+      </div>
     </main>
   );
 }

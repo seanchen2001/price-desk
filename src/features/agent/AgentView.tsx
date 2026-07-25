@@ -1,8 +1,12 @@
-// Tab "Agente" (Fase 8) — chat con tools tipadas (estilo ChatBox viejo, sin supervisor).
-// El modelo PROPONE tool calls; executeTool las ejecuta CLIENT-side vía la capa de datos
-// (mutaciones por fila, identidad por resolveModel). Destructivas → confirmación UI.
-// Errores VISIBLES en el chat y timeout ruidoso a 30s (transporte). Cada turno queda
-// en chat_log (append por fila).
+// Panel LATERAL del agente (Fase 8) — paridad con el ChatBox del viejo: vive colapsable
+// a la derecha, disponible desde TODOS los tabs (la vista principal se encoge por flex).
+// Siempre MONTADO (display:none al colapsar) para que la conversación sobreviva al
+// abrir/cerrar; el estado abierto/cerrado persiste en localStorage (store.ts).
+//
+// El motor no cambia respecto de Fase 8: el modelo PROPONE tool calls; executeTool las
+// ejecuta CLIENT-side vía la capa de datos (mutaciones por fila, identidad por
+// resolveModel). Destructivas → confirmación UI. Errores VISIBLES, timeout ruidoso 30s,
+// log por turno en chat_log. Recibe el tab activo para contextualizar pedidos ambiguos.
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import type { Json } from "../../data/database.types";
@@ -15,6 +19,7 @@ import s from "../mesa/styles";
 import { executeTool, type ToolCall, type ToolResult } from "./executor";
 import { functionCallsOf, generateTurn, textOf, type GeminiContent } from "./gemini";
 import { buildLiveDeps } from "./liveDeps";
+import { useAgentPanel } from "./store";
 import { AGENT_TOOLS, buildAgentSystem, CONFIRM_TOOLS, MUTATING_TOOLS } from "./tools";
 
 const MAX_TURNS = 8;
@@ -28,12 +33,58 @@ type ChatMsg =
 type PendingConfirm = { call: ToolCall; resolve: (ok: boolean) => void };
 
 const chatStyles = {
+  aside: {
+    width: 372,
+    flexShrink: 0,
+    position: "sticky" as const,
+    top: 10,
+    alignSelf: "flex-start" as const,
+    background: "#0b0f17",
+    border: "1px solid #1c2433",
+    borderRadius: 10,
+    padding: 10,
+    flexDirection: "column" as const,
+    gap: 8,
+    maxHeight: "calc(100vh - 24px)",
+  },
+  head: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#8ea0bf",
+    letterSpacing: 0.4,
+  },
+  collapse: {
+    background: "transparent",
+    border: "none",
+    color: "#8b94a7",
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  reopen: {
+    position: "fixed" as const,
+    right: 0,
+    top: "45%",
+    zIndex: 50,
+    background: "#1d2A44",
+    color: "#e6ebf5",
+    border: "1px solid #3b4a68",
+    borderRight: "none",
+    borderRadius: "8px 0 0 8px",
+    padding: "10px 6px",
+    cursor: "pointer",
+    fontSize: 12,
+    writingMode: "vertical-rl" as const,
+  },
   log: {
     background: "#0d1119",
     border: "1px solid #1c2433",
     borderRadius: 8,
     padding: 10,
-    height: "52vh",
+    flex: 1,
+    minHeight: 220,
     overflowY: "auto" as const,
     display: "flex",
     flexDirection: "column" as const,
@@ -48,7 +99,6 @@ const chatStyles = {
     border: "1px solid #5a4a1d",
     borderRadius: 8,
     padding: "8px 10px",
-    marginTop: 8,
   },
 } as const;
 
@@ -57,7 +107,22 @@ function argsPreview(args: Record<string, unknown>): string {
   return j.length > 140 ? j.slice(0, 140) + "…" : j;
 }
 
-export function AgentView() {
+/** Ejecuta una tool sin tirar: el error vuelve como resultado visible (y para el modelo). */
+async function runSafely(
+  call: ToolCall,
+  deps: ReturnType<typeof buildLiveDeps>,
+): Promise<ToolResult> {
+  try {
+    return await executeTool(call, deps);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export function AgentPanel(props: { activeTabLabel: string }) {
+  const open = useAgentPanel((st) => st.open);
+  const setOpen = useAgentPanel((st) => st.setOpen);
+
   const departments = useDepartments();
   const categories = useCategories();
   const suppliers = useSuppliers();
@@ -95,6 +160,7 @@ export function AgentView() {
       suppliers: (suppliers.data ?? []).filter((sp) => sp.active).map((sp) => sp.name),
       modelCount: (models.data ?? []).length,
       knowledge: (knowledge.data ?? []).map((k) => k.rule_text),
+      activeTab: props.activeTabLabel,
     });
     const deps = buildLiveDeps();
     const contents = contentsRef.current;
@@ -188,19 +254,35 @@ export function AgentView() {
   };
 
   return (
-    <div>
-      <section style={s.section}>
-        <div style={s.sectionTitle}>
-          Agente (Gemini 2.5 Flash + tools tipadas) — propone; el código ejecuta vía el
-          resolvedor y las mutaciones por fila. Destructivas piden confirmación.
+    <>
+      {!open && (
+        <button onClick={() => setOpen(true)} style={chatStyles.reopen} title="Abrir el asistente">
+          💬 ASISTENTE
+        </button>
+      )}
+      {/* siempre montado: display none al colapsar conserva la conversación */}
+      <aside style={{ ...chatStyles.aside, display: open ? "flex" : "none" }}>
+        <div style={chatStyles.head}>
+          <span>💬 ASISTENTE</span>
+          <span style={{ fontWeight: 400, color: "#5b657a", fontSize: 10.5 }}>
+            mirando: {props.activeTabLabel}
+          </span>
+          <button
+            onClick={() => setOpen(false)}
+            title="Colapsar hacia la derecha"
+            style={chatStyles.collapse}
+          >
+            ▶
+          </button>
         </div>
 
         <div style={chatStyles.log} ref={scrollRef}>
           {messages.length === 0 && (
             <div style={s.hint}>
-              Ej.: “creá la categoría Samsung Gama Alta y mové el S26 ahí” · “cargá S26 12+512
-              a 610 de Bax con escala 20→605 50→595” · “¿cómo vienen las cuentas?” · “¿mejor
-              proveedor para 30 S26?”
+              Tools tipadas sobre la base real (el agente propone; el código ejecuta vía el
+              resolvedor). Ej.: “creá la categoría Samsung Gama Alta y mové el S26 ahí” ·
+              “cargá S26 12+512 a 610 de Bax con escala 20→605 50→595” · “¿cómo vienen las
+              cuentas?” · “¿mejor proveedor para 30 S26?”
             </div>
           )}
           {messages.map((m, i) => (
@@ -215,7 +297,7 @@ export function AgentView() {
         {pending && (
           <div style={chatStyles.confirm}>
             <div style={{ fontSize: 12, color: "#e6c98b", marginBottom: 6 }}>
-              El agente quiere ejecutar una acción destructiva:
+              Acción destructiva propuesta:
               <code style={{ marginLeft: 6 }}>
                 {pending.call.name}({argsPreview(pending.call.args)})
               </code>
@@ -243,13 +325,13 @@ export function AgentView() {
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <div style={{ display: "flex", gap: 6 }}>
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && void send()}
-            placeholder="Pedile algo al agente… (Enter para enviar)"
-            style={{ ...s.textInput, flex: 1 }}
+            placeholder="Pedile algo… (Enter envía)"
+            style={{ ...s.textInput, flex: 1, minWidth: 0 }}
             disabled={busy}
           />
           <button
@@ -257,25 +339,18 @@ export function AgentView() {
             disabled={busy || !input.trim()}
             style={{ ...s.primaryBtn, ...(busy ? s.busy : {}) }}
           >
-            {busy ? "Trabajando…" : "Enviar"}
+            {busy ? "…" : "Enviar"}
           </button>
-          <button onClick={reset} style={{ ...s.toolBtn, ...s.toolBtnGhost }} disabled={busy}>
-            Nueva conversación
+          <button
+            onClick={reset}
+            style={{ ...s.toolBtn, ...s.toolBtnGhost }}
+            disabled={busy}
+            title="Nueva conversación"
+          >
+            ⟲
           </button>
         </div>
-      </section>
-    </div>
+      </aside>
+    </>
   );
-}
-
-/** Ejecuta una tool sin tirar: el error vuelve como resultado visible (y para el modelo). */
-async function runSafely(
-  call: ToolCall,
-  deps: ReturnType<typeof buildLiveDeps>,
-): Promise<ToolResult> {
-  try {
-    return await executeTool(call, deps);
-  } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
-  }
 }
