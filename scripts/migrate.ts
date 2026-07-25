@@ -225,13 +225,32 @@ function canonName(aliases: Record<string, string>, name: string | null | undefi
   return aliases[n] ?? n;
 }
 
+// FUSIONES DE CLIENTES decididas por el usuario (durables): cualquier cliente cuyo
+// nombre matchee la KEY (ci, includes) se fusiona en el que matchee el VALUE. La fila
+// canónica se queda con los datos más completos de los dos; TODOS los invoices.client_id
+// y ledger.party_id del fusionado apuntan al canónico. Una re-corrida de la migración
+// produce directamente la cuenta única. (2026-07-25: INTALPER = Ojus.)
+const CLIENT_MERGES: Record<string, string> = { INTALPER: "Ojus" };
+
+const nameMatches = (name: string | undefined | null, key: string): boolean =>
+  (name ?? "").trim().toLowerCase().includes(key.trim().toLowerCase());
+
+/** colapsa nombres fusionados a una misma clave (para comparar saldos viejo vs nuevo). */
+function mergedCanon(name: string): string {
+  for (const [fromKey, toKey] of Object.entries(CLIENT_MERGES)) {
+    if (nameMatches(name, fromKey) || nameMatches(name, toKey)) return toKey;
+  }
+  return name;
+}
+
 // PORT 1:1 del computeAccounts VIEJO (lib/accounts.js) — SOLO para la validación
 // "totales viejos con la lógica vieja". El orden no afecta el saldo final, así que
 // devolvemos directamente { cuentaCanónica → saldo }.
 function oldSaldos(kv: OldKv, side: "client" | "supplier"): Record<string, number> {
   const saldo: Record<string, number> = {};
   const add = (party: string, cargo: number, pago: number): void => {
-    const p = canonName(kv.aliases, party);
+    const canon = canonName(kv.aliases, party);
+    const p = side === "client" ? mergedCanon(canon) : canon;
     saldo[p] = (saldo[p] ?? 0) + cargo - pago;
   };
   for (const f of kv.invoices) {
@@ -562,22 +581,50 @@ async function main(): Promise<void> {
     }));
 
   // ---------- 4. actores: clients / shippings ----------
+  // fusiones ANTES de crear filas: el fusionado no genera fila; sus ids/nombres viejos
+  // apuntan al canónico, así invoices/ledger caen solos en la cuenta única.
+  const mergeTargetOf = new Map<OldClient, OldClient>(); // fusionado → canónico
+  for (const [fromKey, toKey] of Object.entries(CLIENT_MERGES)) {
+    const target = kv.clients.find((c) => nameMatches(c.name, toKey));
+    if (!target) continue;
+    for (const c of kv.clients) {
+      if (c !== target && nameMatches(c.name, fromKey)) mergeTargetOf.set(c, target);
+    }
+  }
   const clientIdByOldId = new Map<string, string>();
   const clientIdByName = new Map<string, string>();
-  const clientRows: Ins<"clients">[] = kv.clients.map((c) => {
-    const id = randomUUID();
-    if (c.id) clientIdByOldId.set(c.id, id);
-    if (c.name) clientIdByName.set(c.name.trim(), id);
-    return {
-      id,
-      name: c.name ?? "—",
-      address: c.address ?? null,
-      ruc: c.ruc ?? null,
-      phone: c.phone ?? null,
-      cuenta_corriente: c.cuentaCorriente ?? false,
-      es_nuestra: c.esNuestra ?? false,
-    };
-  });
+  const clean = (v: string | undefined): string | null => {
+    const t = (v ?? "").trim();
+    return t === "" ? null : t;
+  };
+  const clientRows: Ins<"clients">[] = kv.clients
+    .filter((c) => !mergeTargetOf.has(c))
+    .map((c) => {
+      const id = randomUUID();
+      if (c.id) clientIdByOldId.set(c.id, id);
+      if (c.name) clientIdByName.set(c.name.trim(), id);
+      // datos más completos de los dos: lo vacío del canónico se llena con lo del fusionado
+      const sources = [...mergeTargetOf.entries()].filter(([, t]) => t === c).map(([s]) => s);
+      for (const s of sources) {
+        if (s.id) clientIdByOldId.set(s.id, id);
+        if (s.name) clientIdByName.set(s.name.trim(), id);
+        report.warnings.push(
+          `fusión de clientes (CLIENT_MERGES): "${s.name ?? "?"}" → "${c.name ?? "?"}" (facturas y ledger repuntados)`,
+        );
+      }
+      const fill = (own: string | undefined, key: "address" | "ruc" | "phone"): string | null =>
+        clean(own) ?? sources.map((s) => clean(s[key])).find((v) => v !== null) ?? null;
+      return {
+        id,
+        name: c.name ?? "—",
+        address: fill(c.address, "address"),
+        ruc: fill(c.ruc, "ruc"),
+        phone: fill(c.phone, "phone"),
+        cuenta_corriente:
+          (c.cuentaCorriente ?? false) || sources.some((s) => s.cuentaCorriente === true),
+        es_nuestra: c.esNuestra ?? false,
+      };
+    });
   const shipIdByOldId = new Map<string, string>();
   const shipRows: Ins<"shippings">[] = kv.shippings.map((s) => {
     const id = randomUUID();
@@ -897,7 +944,8 @@ async function main(): Promise<void> {
         const nm =
           (side === "client" ? clientNameById.get(partyId) : supplierNameById.get(partyId)) ?? partyId;
         porCuenta[nm] = round2((porCuenta[nm] ?? 0) + acc.saldo);
-        const c = canonName(kv.aliases, nm);
+        const base = canonName(kv.aliases, nm);
+        const c = side === "client" ? mergedCanon(base) : base;
         canon[c] = round2((canon[c] ?? 0) + acc.saldo);
       }
       return { canon, porCuenta };
